@@ -160,6 +160,7 @@ pub struct FunctionBuilder {
     start: BbName,
     ret: Option<LocalName>,
     conv: CallingConvention,
+    implicit_writes: bool,
 
     cur_block: Option<CurBlock>,
 
@@ -177,6 +178,7 @@ impl FunctionBuilder {
             start: BbName(Name::from_internal(0)),
             ret: None,
             conv: CallingConvention::Rust,
+            implicit_writes: true,
             cur_block: None,
             next_block: 0,
             next_local: 0,
@@ -232,6 +234,7 @@ impl FunctionBuilder {
             calling_convention: self.conv,
             blocks: self.blocks,
             start: self.start,
+            implicit_writes: self.implicit_writes,
         }
     }
 
@@ -282,6 +285,10 @@ impl FunctionBuilder {
     /// Change the calling convention of the current function.
     pub fn set_conv(&mut self, conv: CallingConvention) {
         self.conv = conv;
+    }
+
+    pub fn set_implicit_writes(&mut self, implicit_writes: bool) {
+        self.implicit_writes = implicit_writes;
     }
 
     /// Build one or multiple cleanup blocks. The name of the first block is returned.

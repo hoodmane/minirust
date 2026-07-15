@@ -104,9 +104,10 @@ impl<M: Memory> ConcurrentMemory<M> {
         ptr: Pointer<M::Provenance>,
         ptr_type: PtrType,
         fn_entry: bool,
+        fn_implicit_writes: bool, // wether implicit_writes are enabled for the currently evaluated function, or not
         vtable_lookup: impl Fn(ThinPointer<M::Provenance>) -> crate::lang::VTable + 'static,
     ) -> Result<Pointer<M::Provenance>> {
-        self.memory.retag_ptr(frame_extra, ptr, ptr_type, fn_entry, vtable_lookup)
+        self.memory.retag_ptr(frame_extra, ptr, ptr_type, fn_entry, fn_implicit_writes, vtable_lookup)
     }
 
     /// Memory model hook invoked at the end of each function call.

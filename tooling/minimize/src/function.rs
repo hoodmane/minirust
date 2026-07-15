@@ -27,6 +27,9 @@ pub struct FnCtxt<'cx, 'tcx> {
 
     pub locals: Map<LocalName, Type>,
     pub blocks: Map<BbName, BasicBlock>,
+
+    /// Whether implicit writes are enabled. Set to false if the function has `#[rustc_no_writable]`.
+    implicit_writes: bool,
 }
 
 impl<'cx, 'tcx> std::ops::Deref for FnCtxt<'cx, 'tcx> {
@@ -46,6 +49,7 @@ impl<'cx, 'tcx> std::ops::DerefMut for FnCtxt<'cx, 'tcx> {
 impl<'cx, 'tcx> FnCtxt<'cx, 'tcx> {
     pub fn new(instance: rs::Instance<'tcx>, cx: &'cx mut Ctxt<'tcx>) -> Self {
         let body = cx.tcx.instance_mir(instance.def);
+        let implicit_writes = !rustc_hir::find_attr!(cx.tcx, instance.def_id(), RustcNoWritable);
         // We eagerly instantiate everything upfront once.
         // Then nothing else has to worry about generics.
         let body = cx.tcx.instantiate_and_normalize_erasing_regions(
@@ -70,6 +74,7 @@ impl<'cx, 'tcx> FnCtxt<'cx, 'tcx> {
             locals_smir,
             next_bb: 0,
             next_local: 0,
+            implicit_writes,
         }
     }
 
@@ -197,6 +202,7 @@ impl<'cx, 'tcx> FnCtxt<'cx, 'tcx> {
             blocks: self.blocks,
             start: init_bb,
             calling_convention: translate_calling_convention(self.abi.conv),
+            implicit_writes: self.implicit_writes,
         };
 
         f

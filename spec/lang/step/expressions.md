@@ -170,7 +170,7 @@ impl<M: Memory> Machine<M> {
         // Let the aliasing model know.
         let lookup = self.vtable_lookup();
         let ptr = self.mutate_cur_frame(|frame, mem| {
-            mem.retag_ptr(&mut frame.extra, place.ptr, ptr_ty, /* fn_entry */ false, lookup)
+            mem.retag_ptr(&mut frame.extra, place.ptr, ptr_ty, /* fn_entry */ false, /* fn_implicit_writes */ true, lookup)
         })?;
         
         ret((Value::Ptr(ptr), Type::Ptr(ptr_ty)))

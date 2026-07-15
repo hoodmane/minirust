@@ -9,6 +9,7 @@ Similar to the [Basic Memory Model](../basic.md), we need to first define some b
 the core date structure managing the tree is defined in [tree.md](tree.md), and the core state machine can be found in [state_machine.md](state_machine.md).
 
 The model then tracks a tree for each allocation:
+
 ```rust
 struct TreeBorrowsAllocationExtra {
     root: Node,
@@ -17,6 +18,7 @@ struct TreeBorrowsAllocationExtra {
 
 We use a *path* to identify each node and track its location in the tree. A path is represented as a list of indices $[i_1, i_2, ..., i_k]$, where each index indicates which branch to take next.
 Below is an illustrated example:
+
 ```
 Consider the following tree
       A
@@ -242,9 +244,10 @@ impl<T: Target> Memory for TreeBorrowsMemory<T> {
         ptr: Pointer<Self::Provenance>,
         ptr_type: PtrType,
         fn_entry: bool,
+        fn_implicit_writes: bool, // wether implicit_writes are enabled for the currently evaluated function, or not
         vtable_lookup: impl Fn(ThinPointer<Self::Provenance>) -> crate::lang::VTable + 'static,
     ) -> Result<Pointer<Self::Provenance>> {
-        ret(if let Some(perms) = ReborrowSettings::new(ptr, ptr_type, fn_entry, self.params, vtable_lookup) {
+        ret(if let Some(perms) = ReborrowSettings::new(ptr, ptr_type, fn_entry, self.params, fn_implicit_writes, vtable_lookup) {
             self.reborrow(ptr.thin_pointer, perms, frame_extra)?.widen(ptr.metadata)
         } else {
             ptr

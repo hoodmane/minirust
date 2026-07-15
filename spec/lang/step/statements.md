@@ -102,7 +102,7 @@ impl<M: Memory> Machine<M> {
             // base case
             (Value::Ptr(ptr), Type::Ptr(ptr_type)) => {
                 let lookup = self.vtable_lookup();
-                let val = self.mutate_cur_frame(|frame, mem| { mem.retag_ptr(&mut frame.extra, ptr, ptr_type, fn_entry, lookup) })?;
+                let val = self.mutate_cur_frame(|frame, mem| { mem.retag_ptr(&mut frame.extra, ptr, ptr_type, fn_entry, frame.func.implicit_writes, lookup) })?;
                 Value::Ptr(val)
             }
             // recurse into tuples/arrays/enums

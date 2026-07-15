@@ -487,6 +487,9 @@ pub struct Function {
     pub blocks: Map<BbName, BasicBlock>,
     /// The basic block where execution starts.
     pub start: BbName,
+
+    /// Whether implicit writes are enabled for this function.
+    pub implicit_writes: bool,
 }
 
 /// A basic block is a sequence of statements followed by a terminator.

@@ -82,6 +82,7 @@ pub fn function(ret: Ret, num_args: usize, locals: &[Type], bbs: &[BasicBlock]) 
         start,
         // For now we use the C ABI for everything since that's what `spawn` needs...
         calling_convention: CallingConvention::C,
+        implicit_writes: true,
     }
 }
 

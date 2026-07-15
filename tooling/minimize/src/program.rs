@@ -235,5 +235,6 @@ fn mk_start_fn(entry: u32) -> Function {
         blocks,
         start: b0_name,
         calling_convention: CallingConvention::C,
+        implicit_writes: true,
     }
 }

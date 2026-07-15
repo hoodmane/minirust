@@ -142,6 +142,7 @@ pub trait Memory {
         ptr: Pointer<Self::Provenance>,
         _ptr_type: PtrType,
         _fn_entry: bool,
+        _fn_implicit_writes: bool,
         _vtable_lookup: impl Fn(ThinPointer<Self::Provenance>) -> crate::lang::VTable + 'static,
     ) -> Result<Pointer<Self::Provenance>> {
         ret(ptr)
