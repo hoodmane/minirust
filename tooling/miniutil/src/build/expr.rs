@@ -13,6 +13,10 @@ pub fn const_bool(b: bool) -> ValueExpr {
     ValueExpr::Constant(Constant::Bool(b), Type::Bool)
 }
 
+pub fn const_extern_ref_null() -> ValueExpr {
+    ValueExpr::Constant(Constant::ExternRefNull, Type::ExternRef)
+}
+
 #[track_caller]
 pub fn tuple(args: &[ValueExpr], ty: Type) -> ValueExpr {
     let Type::Tuple { sized_fields, .. } = ty else {

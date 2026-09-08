@@ -398,6 +398,24 @@ impl<M: Memory> Machine<M> {
         ret(ThinPointer { addr: ptr.addr + offset, ..ptr })
     }
 
+    /// Perform in-bounds arithmetic on an externref table pointer, in slot units.
+    /// This is only used internally for place projections into externref arrays;
+    /// surface pointer arithmetic on table pointers (`PtrOffset { inbounds: true }`)
+    /// is UB since it goes through the byte-space `signed_dereferenceable`.
+    fn table_ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> Result<ThinPointer<M::Provenance>> {
+        // Ensure dereferenceability in the table address space.
+        self.mem.table_signed_dereferenceable(ptr, offset)?;
+        // This also ensures that `offset` fits in an `isize` and that the
+        // arithmetic does not overflow, as for `ptr_offset_inbounds`.
+        assert!(offset.in_bounds(Signed, M::T::PTR_SIZE));
+        assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE));
+        // All checked!
+        ret(ThinPointer { addr: ptr.addr + offset, ..ptr })
+    }
+
+    // Note that an inbounds `PtrOffset` on a pointer into the externref table is UB
+    // (`signed_dereferenceable` rejects table allocations), while a wrapping offset
+    // is plain integer arithmetic whose result is a pointer that is UB to use.
     fn eval_bin_op(
         &self,
         BinOp::PtrOffset { inbounds }: BinOp,

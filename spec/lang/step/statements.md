@@ -97,7 +97,7 @@ impl<M: Memory> Machine<M> {
     fn retag_val(&mut self, val: Value<M>, ty: Type, fn_entry: bool) -> Result<Value<M>> {
         ret(match (val, ty) {
             // no (identifiable) pointers
-            (Value::Int(..) | Value::Bool(..) | Value::Union(..), _) =>
+            (Value::Int(..) | Value::Bool(..) | Value::Union(..) | Value::ExternRef(..), _) =>
                 val,
             // base case
             (Value::Ptr(ptr), Type::Ptr(ptr_type)) => {
@@ -150,7 +150,12 @@ impl<M: Memory> Machine<M> {
             throw_ub!("de-initializing a place based on a misaligned pointer");
         }
         // Alignment was already checked.
-        self.mem.deinit(p.ptr.thin_pointer, ty.layout::<M::T>().expect_size("WF ensures deinits are sized"), Align::ONE)?;
+        let layout = ty.layout::<M::T>();
+        if layout.is_extern_ref() {
+            self.mem.table_deinit(p.ptr.thin_pointer, layout.expect_slots("WF ensures deinits are sized"))?;
+        } else {
+            self.mem.deinit(p.ptr.thin_pointer, layout.expect_size("WF ensures deinits are sized"), Align::ONE)?;
+        }
 
         ret(())
     }
@@ -167,19 +172,31 @@ impl<M: Memory> StackFrame<M> {
         // First remove the old storage, if any.
         // This means the same address may be re-used for the new stoage.
         self.storage_dead(mem, local)?;
-        // Then allocate the new storage.
-        let pointee_size = self.func.locals[local].layout::<M::T>().expect_size("WF ensures all locals are sized");
-        let pointee_align = self.func.locals[local].layout::<M::T>().expect_align("WF ensures all locals are sized");
-        let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?;
+        // Then allocate the new storage, in the address space determined by the local's type.
+        let layout = self.func.locals[local].layout::<M::T>();
+        let ptr = if layout.is_extern_ref() {
+            let slots = layout.expect_slots("WF ensures all locals are sized");
+            mem.table_allocate(AllocationKind::Stack, slots)?
+        } else {
+            let pointee_size = layout.expect_size("WF ensures all locals are sized");
+            let pointee_align = layout.expect_align("WF ensures all locals are sized");
+            mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?
+        };
         self.locals.insert(local, ptr);
         ret(())
     }
 
     fn storage_dead(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
-        let pointee_size = self.func.locals[local].layout::<M::T>().expect_size("WF ensures all locals are sized");
-        let pointee_align = self.func.locals[local].layout::<M::T>().expect_align("WF ensures all locals are sized");
+        let layout = self.func.locals[local].layout::<M::T>();
         if let Some(ptr) = self.locals.remove(local) {
-            mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?;
+            if layout.is_extern_ref() {
+                let slots = layout.expect_slots("WF ensures all locals are sized");
+                mem.table_deallocate(ptr, AllocationKind::Stack, slots)?;
+            } else {
+                let pointee_size = layout.expect_size("WF ensures all locals are sized");
+                let pointee_align = layout.expect_align("WF ensures all locals are sized");
+                mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?;
+            }
         }
         ret(())
     }

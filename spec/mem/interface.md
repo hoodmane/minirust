@@ -49,6 +49,26 @@ impl<Provenance> AbstractByte<Provenance> {
 }
 ```
 
+## Externref table storage
+
+Besides byte memory, MiniRust memory has a second address space: the *externref table*.
+This models the WebAssembly tables that back pointers-to-externref: an `externref` is an opaque reference provided by the host, it has no byte representation, and values of this type are stored whole in table *slots* (a pointer into the table address space is an ordinary pointer value whose address is a slot index).
+
+```rust
+/// An externref value: an opaque reference provided by the host (the `Int`
+/// identifies a host-created reference and has no further structure), or the
+/// null externref (`None`).
+pub type ExternRef = Option<Int>;
+
+/// The contents of one externref table slot.
+pub enum ExternRefSlot {
+    /// An uninitialized slot.
+    Uninit,
+    /// A slot storing an externref value.
+    Init(ExternRef),
+}
+```
+
 ## Memory interface
 
 The MiniRust memory interface is described by the following (not-yet-complete) trait definition.
@@ -123,6 +143,41 @@ pub trait Memory {
             self.dereferenceable(begin_ptr, Size::from_bytes(-len).unwrap())
         }
     }
+
+    /// Create a new externref table allocation with `count` slots, all `Uninit`.
+    /// The address of the returned pointer is a slot index in the externref table
+    /// address space, which is entirely disjoint from byte memory addresses.
+    fn table_allocate(&mut self, kind: AllocationKind, count: Int) -> NdResult<ThinPointer<Self::Provenance>>;
+
+    /// Remove an externref table allocation.
+    fn table_deallocate(&mut self, ptr: ThinPointer<Self::Provenance>, kind: AllocationKind, count: Int) -> Result;
+
+    /// Write consecutive slots to the externref table.
+    fn table_store(&mut self, ptr: ThinPointer<Self::Provenance>, slots: List<ExternRefSlot>) -> Result;
+
+    /// Read `count` consecutive slots from the externref table.
+    fn table_load(&mut self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result<List<ExternRefSlot>>;
+
+    /// Test whether the given pointer is dereferenceable for `count` slots in the
+    /// externref table address space.
+    fn table_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result;
+
+    /// A derived form of `table_dereferenceable` that works with a signed notion of "count".
+    fn table_signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result {
+        if count > 0 {
+            self.table_dereferenceable(ptr, count)
+        } else {
+            // Compute a pointer to the beginning of the range, and check `table_dereferenceable` from there.
+            let begin_ptr = ThinPointer { addr: ptr.addr + count, ..ptr };
+            // `ptr.addr + count` might be negative, but then `table_dereferenceable` will surely fail.
+            self.table_dereferenceable(begin_ptr, -count)
+        }
+    }
+
+    /// Whether this provenance belongs to an externref table allocation.
+    /// This is needed to make exposing the provenance of table pointers UB,
+    /// since provenance is opaque outside the memory model.
+    fn is_table_provenance(&self, provenance: Self::Provenance) -> bool;
 
     /// Retag the given pointer, which has the given type.
     /// `fn_entry` indicates whether this is one of the special retags that happen

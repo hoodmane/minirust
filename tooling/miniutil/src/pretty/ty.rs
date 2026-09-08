@@ -20,6 +20,7 @@ pub(super) fn fmt_type(t: Type, comptypes: &mut Vec<CompType>) -> FmtExpr {
         }
         Type::TraitObject(trait_name) =>
             FmtExpr::Atomic(format!("dyn {}", fmt_trait_name(trait_name))),
+        Type::ExternRef => FmtExpr::Atomic(format!("externref")),
     }
 }
 
@@ -86,6 +87,7 @@ fn fmt_layout_strategy(layout: LayoutStrategy) -> String {
                 fmt_layout_strategy(tail.extract())
             )
         }
+        LayoutStrategy::ExternRefSized(count) => format!("slots={count}"),
     }
 }
 

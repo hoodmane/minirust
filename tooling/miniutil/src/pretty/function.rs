@@ -253,6 +253,10 @@ fn fmt_terminator(t: Terminator, comptypes: &mut Vec<CompType>) -> String {
                 IntrinsicOp::PointerExposeProvenance => "pointer_expose_provenance",
                 IntrinsicOp::PointerWithExposedProvenance => "pointer_with_exposed_provenance",
                 IntrinsicOp::GetUnwindPayload => "get_unwind_payload",
+                IntrinsicOp::ExternRefNew => "extern_ref_new",
+                IntrinsicOp::ExternRefIsNull => "extern_ref_is_null",
+                IntrinsicOp::ExternRefAllocate => "extern_ref_allocate",
+                IntrinsicOp::ExternRefDeallocate => "extern_ref_deallocate",
             };
             let args: Vec<_> =
                 arguments.iter().map(|arg| fmt_value_expr(arg, comptypes).to_string()).collect();

@@ -54,6 +54,11 @@ impl LayoutStrategy {
                 tail.check_wf::<T>(prog)?;
                 ensure_wf(!tail.is_sized(), "LayoutStrategy: tuple with sized tail")?;
             }
+            LayoutStrategy::ExternRefSized(count) => {
+                // Slot counts are bounded like byte sizes, so that slot indices
+                // (which are pointer addresses) behave like ordinary addresses.
+                ensure_wf(count >= 0 && T::valid_size(Size::from_bytes(count).unwrap()), "LayoutStrategy: invalid externref slot count")?;
+            }
         };
 
         ret(())
@@ -71,6 +76,8 @@ impl LayoutStrategy {
             LayoutStrategy::TraitObject(..) => (),
             // The size and align computation aligns the size of the full tuple.
             LayoutStrategy::Tuple { tail, .. } => tail.check_aligned()?,
+            // Table slots have no alignment requirements.
+            LayoutStrategy::ExternRefSized(..) => (),
         };
 
         ret(())
@@ -101,6 +108,8 @@ impl UnsafeCellStrategy {
                 Self::check_cells(head_cells, head.end)?;
                 tail_cells.check_wf::<T>(tail)?;
             },
+            // There are no byte-level UnsafeCells in the externref table.
+            (UnsafeCellStrategy::ExternRef, LayoutStrategy::ExternRefSized(..)) => {},
             _ => {
                 ensure_wf(false, "UnsafeCellStrategy and LayoutStrategy variants do not match")?;
             },
@@ -158,6 +167,9 @@ impl Type {
                     // Ensure it fits after the one we previously checked.
                     ensure_wf(offset >= last_end, "Type::Tuple: overlapping fields")?;
                     ensure_wf(ty.layout::<T>().is_sized(), "Type::Tuple: unsized field type in head")?;
+                    // Externref-space types have no byte layout, so they cannot be tuple fields.
+                    // (Store a pointer to the externref table instead.)
+                    ensure_wf(!ty.layout::<T>().is_extern_ref(), "Type::Tuple: externref field type")?;
                     last_end = offset + ty.layout::<T>().expect_size("ensured to be sized above");
                 }
                 // The unsized field must actually be unsized.
@@ -176,18 +188,26 @@ impl Type {
             }
             Array { elem, count } => {
                 ensure_wf(count >= 0, "Type::Array: negative amount of elements")?;
-                ensure_wf(elem.layout::<T>().is_sized(), "Type::Array: unsized element type")?;
+                // The element type must be checked before we may call `layout()` on it.
                 elem.check_wf::<T>(prog)?;
+                ensure_wf(elem.layout::<T>().is_sized(), "Type::Array: unsized element type")?;
             }
             Slice { elem } => {
-                ensure_wf(elem.layout::<T>().is_sized(), "Type::Slice: unsized element type")?;
+                // The element type must be checked before we may call `layout()` on it.
                 elem.check_wf::<T>(prog)?;
+                // Slices of externref are not supported (only arrays `[externref; N]` are).
+                // Supporting them would require a second unsized layout variant with
+                // slot-unit dispatch in the metadata and deref paths.
+                ensure_wf(!elem.layout::<T>().is_extern_ref(), "Type::Slice: externref element type")?;
+                ensure_wf(elem.layout::<T>().is_sized(), "Type::Slice: unsized element type")?;
             }
             Union { fields, size, chunks, align: _ } => {
                 // The fields may overlap, but they must all fit the size.
                 for (offset, ty) in fields {
                     ty.check_wf::<T>(prog)?;
                     ensure_wf(ty.layout::<T>().is_sized(), "Type::Union: unsized field type")?;
+                    // Externref-space types have no byte layout, so they cannot be union fields.
+                    ensure_wf(!ty.layout::<T>().is_extern_ref(), "Type::Union: externref field type")?;
                     ensure_wf(
                         size >= offset + ty.layout::<T>().expect_size("ensured to be sized above"),
                         "Type::Union: field size does not fit union",
@@ -224,6 +244,8 @@ impl Type {
                     )?;
 
                     variant.ty.check_wf::<T>(prog)?;
+                    // Externref-space types have no byte layout, so they cannot be enum variants.
+                    ensure_wf(!variant.ty.layout::<T>().is_extern_ref(), "Type::Enum: externref variant type")?;
                     let LayoutStrategy::Sized(var_size, var_align) = variant.ty.layout::<T>() else {
                         throw_ill_formed!("Type::Enum: variant type is unsized")
                     };
@@ -245,6 +267,7 @@ impl Type {
             TraitObject(trait_name) => {
                 ensure_wf(prog.traits.contains_key(trait_name), "Type::TraitObject: trait name doesn't exist")?;
             }
+            ExternRef => (),
         }
 
         // Now that we know the type is well-formed,
@@ -319,6 +342,7 @@ impl Constant {
                     "Constant::PointerWithoutProvenance: pointer out-of-bounds"
                 )?;
             }
+            (Constant::ExternRefNull, Type::ExternRef) => (),
             _ => throw_ill_formed!("Constant: value does not match type"),
         }
 
@@ -431,6 +455,9 @@ impl ValueExpr {
                                 Type::Int(int_ty)
                             }
                             Transmute(new_ty) => {
+                                // Externref values have no byte representation, so they cannot be transmuted.
+                                ensure_wf(!operand.layout::<T>().is_extern_ref(), "Cast::Transmute: externref source type")?;
+                                ensure_wf(!new_ty.layout::<T>().is_extern_ref(), "Cast::Transmute: externref target type")?;
                                 ensure_wf(operand.layout::<T>().is_sized(), "Cast::Transmute: unsized source type")?;
                                 ensure_wf(new_ty.layout::<T>().is_sized(), "Cast::Transmute: unsized target type")?;
                                 new_ty
@@ -450,6 +477,8 @@ impl ValueExpr {
                     }
                     ComputeSize(ty) | ComputeAlign(ty) => {
                         ty.check_wf::<T>(prog)?;
+                        // Externref-space types have no byte size or alignment.
+                        ensure_wf(!ty.layout::<T>().is_extern_ref(), "UnOp::ComputeSize|ComputeAlign: externref types have no size or alignment")?;
                         // A thin pointer can also be the target type, with unit metadata.
                         let meta_ty = ty.meta_kind().ty::<T>();
                         if operand != meta_ty {
@@ -812,9 +841,11 @@ impl Terminator {
 impl Function {
     fn check_wf<T: Target>(self, prog: Program) -> Result<()> {
         // Ensure all locals have a valid type.
+        // The type must be checked before we may call `layout()` on it
+        // (e.g. `layout()` panics on slices of unsized types).
         for ty in self.locals.values() {
-            ensure_wf(ty.layout::<T>().is_sized(), "Function: unsized local variable")?;
             ty.check_wf::<T>(prog)?;
+            ensure_wf(ty.layout::<T>().is_sized(), "Function: unsized local variable")?;
         }
 
         // Compute initially live locals: arguments and return values.

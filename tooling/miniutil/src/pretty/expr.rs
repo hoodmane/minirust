@@ -85,6 +85,7 @@ pub(super) fn fmt_constant(c: Constant) -> FmtExpr {
             } else {
                 FmtExpr::Atomic(format!("invalid_ptr({addr})"))
             },
+        Constant::ExternRefNull => FmtExpr::Atomic(format!("null_externref")),
     }
 }
 

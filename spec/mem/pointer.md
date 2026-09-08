@@ -104,6 +104,10 @@ pub enum LayoutStrategy {
         #[specr::indirection]
         tail: LayoutStrategy,
     },
+    /// The type lives in the externref table address space and statically occupies
+    /// the given number of consecutive table slots. It has no byte size or
+    /// alignment; `Size`s and `Align`s never describe it.
+    ExternRefSized(Int),
 }
 
 /// Describes where in a potentially unsized type the UnsafeCell are.
@@ -124,6 +128,9 @@ pub enum UnsafeCellStrategy {
         #[specr::indirection]
         tail_cells: UnsafeCellStrategy,
     },
+    /// Externref table storage. There are no byte-level `UnsafeCell`s.
+    /// TODO: revisit for slot-granular interior mutability / Tree Borrows.
+    ExternRef,
 }
 
 /// Describes what we know about data behind a pointer.

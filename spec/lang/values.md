@@ -21,6 +21,8 @@ enum Value<M: Memory> {
     },
     /// Unions are represented as "lists of chunks", where each chunk is just a raw list of bytes.
     Union(List<List<AbstractByte<M::Provenance>>>),
+    /// A wasm-style opaque host reference, used for `externref`.
+    ExternRef(ExternRef),
 }
 ```
 

@@ -123,6 +123,7 @@ impl<'cx, 'tcx> FnCtxt<'cx, 'tcx> {
                 rs::span_bug!(span, "Constant Unions are currently not supported!"),
             Type::Slice { .. } | Type::TraitObject(..) =>
                 rs::span_bug!(span, "constant unsized values do not exist!"),
+            Type::ExternRef => rs::span_bug!(span, "externref constants do not exist in Rust!"),
         }
     }
 

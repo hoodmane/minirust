@@ -92,6 +92,10 @@ pub enum Constant {
     VTablePointer(VTableName),
     /// A pointer with constant address, not pointing into any allocation.
     PointerWithoutProvenance(Address),
+    /// The null `externref` value.
+    /// (Non-null externref values cannot be constants: they can only be obtained
+    /// from the host via the `ExternRefNew` intrinsic.)
+    ExternRefNull,
 }
 
 pub enum IntUnOp {
@@ -439,6 +443,15 @@ pub enum IntrinsicOp {
     PointerWithExposedProvenance,
     /// Access the current unwinding payload. UB if not currently unwinding.
     GetUnwindPayload,
+    /// Obtain a fresh, non-null `externref` from the host.
+    ExternRefNew,
+    /// Determine whether an `externref` is the null reference; returns `bool`.
+    ExternRefIsNull,
+    /// Allocate an externref table allocation with the given number of slots on
+    /// the "table heap"; returns a thin pointer into the table address space.
+    ExternRefAllocate,
+    /// Deallocate an externref table allocation, given the pointer and its slot count.
+    ExternRefDeallocate,
 }
 ```
 

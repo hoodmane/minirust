@@ -36,6 +36,10 @@ pub struct Machine<M: Memory> {
     /// The Locks
     locks: List<LockState>,
 
+    /// Counts how many externref handles have been created by `ExternRefNew`.
+    /// A `Value::ExternRef(Some(id))` is well-formed iff `0 <= id < extern_ref_count`.
+    extern_ref_count: Int,
+
     /// Stores a pointer to each of the global allocations, which are all `Sized`.
     global_ptrs: Map<GlobalName, ThinPointer<M::Provenance>>,
 
@@ -180,6 +184,7 @@ impl<M: Memory> Machine<M> {
             vtable_ptrs,
             threads: list![],
             locks: List::new(),
+            extern_ref_count: Int::ZERO,
             active_thread: ThreadId::ZERO,
             synchronized_threads: Set::new(),
             stdout,

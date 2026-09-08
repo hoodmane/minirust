@@ -127,6 +127,8 @@ fn check_abi_compatibility(
             caller_discriminant_ty == callee_discriminant_ty &&
             caller_size == callee_size &&
             caller_align == callee_align,
+        (Type::ExternRef, Type::ExternRef) =>
+            true,
         // Different kind of type, definitely incompatible.
         _ =>
             false
@@ -143,11 +145,20 @@ impl<M: Memory> Machine<M> {
         // Make the old value unobservable because the callee might work on it in-place.
         // This also checks that the memory is dereferenceable, and crucially ensures we are aligned
         // *at the given type* -- the callee does not care about packed field projections or things like that!
-        self.mem.deinit(
-            place.ptr.thin_pointer,
-            ty.layout::<M::T>().expect_size("WF ensures arguments and return types are sized"),
-            ty.layout::<M::T>().expect_align("WF ensures arguments and return types are sized")
-        )?;
+        // (Externref-space places live in the table address space, where there are no alignment requirements.)
+        let layout = ty.layout::<M::T>();
+        if layout.is_extern_ref() {
+            self.mem.table_deinit(
+                place.ptr.thin_pointer,
+                layout.expect_slots("WF ensures arguments and return types are sized")
+            )?;
+        } else {
+            self.mem.deinit(
+                place.ptr.thin_pointer,
+                layout.expect_size("WF ensures arguments and return types are sized"),
+                layout.expect_align("WF ensures arguments and return types are sized")
+            )?;
+        }
         // FIXME: This also needs aliasing model support.
 
         ret(())
@@ -221,7 +232,13 @@ impl<M: Memory> Machine<M> {
             // Copy the value at caller (source) type -- that's necessary since it is the type we did the load at (in `eval_argument`).
             // We know the types have compatible layout so this will fit into the allocation.
             // The local is freshly allocated so there should be no reason the store can fail.
-            let align = caller_ty.layout::<M::T>().expect_align("WF ensures function arguments are sized");
+            let layout = caller_ty.layout::<M::T>();
+            let align = if layout.is_extern_ref() {
+                // Ignored by the table path of `typed_store`; table slots have no alignment.
+                Align::ONE
+            } else {
+                layout.expect_align("WF ensures function arguments are sized")
+            };
             self.typed_store(frame.locals[callee_local], caller_val, caller_ty, align, Atomicity::None).unwrap();
         }
 
@@ -329,7 +346,13 @@ impl<M: Memory> Machine<M> {
         // To match `Call`, and since the callee might have written to its return place using a totally different type,
         // we copy at the callee (source) type -- the one place where we ensure the return value matches that type.
         let callee_ty = frame.func.locals[frame.func.ret];
-        let align = callee_ty.layout::<M::T>().expect_align("the return value is a local and thus sized");
+        let layout = callee_ty.layout::<M::T>();
+        let align = if layout.is_extern_ref() {
+            // Ignored by the table path of `typed_load`/`typed_store`; table slots have no alignment.
+            Align::ONE
+        } else {
+            layout.expect_align("the return value is a local and thus sized")
+        };
         let ret_val = self.typed_load(frame.locals[frame.func.ret], callee_ty, align, Atomicity::None)?;
 
         // Deallocate everything.

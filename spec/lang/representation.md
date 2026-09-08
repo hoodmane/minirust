@@ -457,6 +457,23 @@ impl Type {
 }
 ```
 
+### Externref
+
+Externref values have no byte representation at all; they live in the externref table address space.
+Hence there is no byte representation relation for them; the slot-based "representation" for the table address space is defined [below](#externref-table-representation).
+(Arrays of externref never reach the byte `Array` (de)serialization either, since `typed_load`/`typed_store` dispatch on the layout first.)
+
+```rust
+impl Type {
+    fn decode<M: Memory>(Type::ExternRef: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+        panic!("decode of Type::ExternRef: externref values have no byte representation")
+    }
+    fn encode<M: Memory>(Type::ExternRef: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+        panic!("encode of Type::ExternRef: externref values have no byte representation")
+    }
+}
+```
+
 ## Well-formed values
 
 We call a value `val` *well-formed* for a type `ty` if `machine.check_value(val, ty).is_ok()`.
@@ -510,6 +527,20 @@ impl<M: Memory> Machine<M> {
 
         // Safe pointer, i.e. references, boxes
         if let Some(pointee) = ptr_ty.safe_pointee() {
+            if pointee.layout.is_extern_ref() {
+                // A safe pointer into the externref table address space.
+                // Table slots have no alignment requirements, and slot indices are
+                // bounded by the table, so only non-nullness, inhabitedness, and
+                // dereferenceability (in the table address space) remain to be checked.
+                let slots = pointee.layout.expect_slots("externref pointees have a static slot count");
+                ensure_else_ub(ptr.thin_pointer.addr != 0, "Value::Ptr: null safe pointer")?;
+                ensure_else_ub(pointee.inhabited, "Value::Ptr: safe pointer to uninhabited type")?;
+                ensure_else_ub(
+                    self.mem.table_dereferenceable(ptr.thin_pointer, slots).is_ok(),
+                    "Value::Ptr: non-dereferenceable safe pointer"
+                )?;
+                return Ok(());
+            }
             let size = self.compute_size(pointee.layout, ptr.metadata);
             let align = self.compute_align(pointee.layout, ptr.metadata);
             // The total size must be at most `isize::MAX`.
@@ -570,6 +601,13 @@ impl<M: Memory> Machine<M> {
                 };
                 self.check_value(data, variant.ty)?;
             }
+            (Value::ExternRef(r), Type::ExternRef) => {
+                // The null externref is always valid; a host reference must have
+                // actually been handed out by the host (`ExternRefNew`).
+                if let Some(id) = r {
+                    ensure_else_ub(id >= 0 && id < self.extern_ref_count, "Value::ExternRef: invalid externref handle")?;
+                }
+            }
             (_, Type::Slice { .. }) => panic!("Value: slices cannot be represented as values"),
             (_, Type::TraitObject { .. }) => panic!("Value: trait objects cannot be represented as values"),
             _ => panic!("Value: value does not match type")
@@ -595,27 +633,100 @@ Since all values are well-formed, (thus a store with a ill-formed value is a spe
 
 This interface is inspired by [Cerberus](https://www.cl.cam.ac.uk/~pes20/cerberus/).
 
+The typed accesses dispatch on the address space of the type:
+values of externref-space types (externref, and arrays of it) are stored whole into table slots, everything else is (de)serialized to bytes.
+The `align` parameter is meaningless (and ignored) for externref-space types, since table slots have no alignment requirements.
+
 ```rust
 impl<M: Memory> Machine<M> {
     fn typed_store(&mut self, ptr: ThinPointer<M::Provenance>, val: Value<M>, ty: Type, align: Align, atomicity: Atomicity) -> Result {
         // All values floating around in MiniRust must be well-formed.
         assert!(self.check_value(val, ty).is_ok(), "trying to store {val:?} which is ill-formed for {:#?}", ty);
-        let bytes = ty.encode::<M>(val);
-        self.mem.store(ptr, bytes, align, atomicity)?;
+        if ty.layout::<M::T>().is_extern_ref() {
+            // Externref values have no bytes; they are stored whole into table slots.
+            self.mem.table_store(ptr, ty.encode_slots::<M>(val), atomicity)?;
+        } else {
+            let bytes = ty.encode::<M>(val);
+            self.mem.store(ptr, bytes, align, atomicity)?;
+        }
 
         ret(())
     }
 
     fn typed_load(&mut self, ptr: ThinPointer<M::Provenance>, ty: Type, align: Align, atomicity: Atomicity) -> Result<Value<M>> {
-        let bytes = self.mem.load(ptr, ty.layout::<M::T>().expect_size("the callers ensure `ty` is sized"), align, atomicity)?;
-        ret(match ty.decode::<M>(bytes) {
-            Some(val) => {
-                // Ensures we only produce well-formed values.
-                self.check_value(val, ty)?;
-                val
+        let layout = ty.layout::<M::T>();
+        if layout.is_extern_ref() {
+            let slots = self.mem.table_load(ptr, layout.expect_slots("the callers ensure `ty` is sized"), atomicity)?;
+            ret(match ty.decode_slots::<M>(slots) {
+                Some(val) => {
+                    // Ensures we only produce well-formed values.
+                    self.check_value(val, ty)?;
+                    val
+                }
+                None => throw_ub!("load of an uninitialized externref slot"),
+            })
+        } else {
+            let bytes = self.mem.load(ptr, layout.expect_size("the callers ensure `ty` is sized"), align, atomicity)?;
+            ret(match ty.decode::<M>(bytes) {
+                Some(val) => {
+                    // Ensures we only produce well-formed values.
+                    self.check_value(val, ty)?;
+                    val
+                }
+                None => throw_ub!("load at type {ty:?} but the data in memory violates the language invariant"), // FIXME use Display instead of Debug for `ty`
+            })
+        }
+    }
+}
+```
+
+## Externref table representation
+
+Values of externref-space types (`externref` itself and arrays of it) are not represented as bytes but as lists of externref table *slots*.
+This is the table-address-space analogue of `encode`/`decode`, and satisfies the analogous [generic properties](#generic-properties) with slots in place of bytes.
+
+```rust
+impl Type {
+    /// Flatten a value of an externref-space type into table slots.
+    /// This may assume `self` is well-formed with an `ExternRefSized` layout,
+    /// and that `val` is well-formed for `self`.
+    fn encode_slots<M: Memory>(self, val: Value<M>) -> List<ExternRefSlot> {
+        match (self, val) {
+            (Type::ExternRef, Value::ExternRef(r)) => list![ExternRefSlot::Init(r)],
+            (Type::Array { elem, .. }, Value::Tuple(vals)) =>
+                vals.flat_map(|v| elem.encode_slots::<M>(v)),
+            _ => panic!("encode_slots: invalid externref-space type or value"),
+        }
+    }
+
+    /// Read a value of an externref-space type back out of table slots.
+    /// Returns `None` if any of the slots is uninitialized.
+    /// This may assume `self` is well-formed with an `ExternRefSized` layout,
+    /// and that `slots.len()` matches the layout's slot count.
+    fn decode_slots<M: Memory>(self, slots: List<ExternRefSlot>) -> Option<Value<M>> {
+        match self {
+            Type::ExternRef => {
+                assert!(slots.len() == 1, "decode_slots of Type::ExternRef with invalid slot count");
+                match slots[Int::ZERO] {
+                    ExternRefSlot::Init(r) => Some(Value::ExternRef(r)),
+                    ExternRefSlot::Uninit => None,
+                }
             }
-            None => throw_ub!("load at type {ty:?} but the data in memory violates the language invariant"), // FIXME use Display instead of Debug for `ty`
-        })
+            Type::Array { elem, count } => {
+                let elem_slots = elem.layout::<M::T>().expect_slots("externref-space array elements occupy a static slot count");
+
+                if slots.len() != elem_slots * count { panic!("decode_slots of Type::Array with invalid slot count"); }
+
+                let chunks: List<_> = (Int::ZERO..count).map(|i|
+                    slots.subslice_with_length(i*elem_slots, elem_slots)
+                ).collect();
+
+                ret(Value::Tuple(
+                    chunks.try_map(|chunk| elem.decode_slots::<M>(chunk))?
+                ))
+            }
+            _ => panic!("decode_slots: not an externref-space type"),
+        }
     }
 }
 ```
@@ -699,6 +810,23 @@ impl<Provenance> DefinedRelation for Pointer<Provenance> {
 }
 ```
 
+The order on externref table slots mirrors the one on `AbstractByte`: initializing a slot makes it "more defined", and initialized slots are only related when equal (externref values have no internal structure to refine):
+```rust
+impl DefinedRelation for ExternRefSlot {
+    fn le_defined(self, other: Self) -> bool {
+        match (self, other) {
+            // `Uninit <= _`: initializing something makes it "more defined".
+            (ExternRefSlot::Uninit, _) =>
+                true,
+            (ExternRefSlot::Init(r1), ExternRefSlot::Init(r2)) =>
+                r1 == r2,
+            // Nothing else is related.
+            _ => false,
+        }
+    }
+}
+```
+
 The order on `List<AbstractByte>` is assumed to be such that `bytes1 <= bytes2` if and only if they have the same length and are bytewise related by `<=`.
 In fact, we define this to be in general how lists are partially ordered (based on the order of their element type):
 ```rust
@@ -727,6 +855,8 @@ impl<M: Memory> DefinedRelation for Value<M> {
             (Variant { discriminant: discriminant1, data: data1 }, Variant { discriminant: discriminant2, data: data2 }) =>
                 discriminant1 == discriminant2 && data1.le_defined(data2),
             (Union(chunks1), Union(chunks2)) => chunks1.le_defined(chunks2),
+            (ExternRef(r1), ExternRef(r2)) =>
+                r1 == r2,
             _ => false
         }
     }

@@ -2,6 +2,7 @@
 #![feature(freeze)]
 
 pub use miniutil::BasicMem;
+pub use miniutil::TreeBorrowMem;
 pub use miniutil::build::*;
 pub use miniutil::pretty::*;
 pub use miniutil::run::*;

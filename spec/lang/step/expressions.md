@@ -53,6 +53,7 @@ impl<M: Memory> Machine<M> {
                     provenance: None,
                 }.widen(None))
             }
+            Constant::ExternRefNull => Value::ExternRef(None),
         })
     }
 
@@ -250,14 +251,25 @@ impl<M: Memory> Machine<M> {
         // We know the pointer is valid for its type, but make sure safe pointers are also dereferenceable.
         // (We don't do a full retag here, this is not considered creating a new pointer.)
         if let Some(pointee) = ptr_type.safe_pointee() {
-            // this was already checked when the value got created
-            assert!(self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr));
-            self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+            if pointee.layout.is_extern_ref() {
+                // Table slots have no alignment requirements, so there is nothing to assert.
+                self.mem.table_dereferenceable(ptr.thin_pointer, pointee.layout.expect_slots("externref pointees have a static slot count"))?;
+            } else {
+                // this was already checked when the value got created
+                assert!(self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr));
+                self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+            }
         }
         // Check whether this pointer is sufficiently aligned.
         // Don't error immediately though! Unaligned places can still be turned into raw pointers.
         // However, they cannot be loaded from.
-        let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr);
+        // Places in the externref table address space are always "aligned":
+        // table slots have no alignment requirements.
+        let aligned = if ty.layout::<M::T>().is_extern_ref() {
+            true
+        } else {
+            self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr)
+        };
 
         ret((Place { ptr, aligned }, ty))
     }
@@ -317,14 +329,21 @@ impl<M: Memory> Machine<M> {
             throw_ub!("access to out-of-bounds index");
         }
 
-        let elem_size = elem_ty.layout::<M::T>().expect_size("WF ensures array & slice elements are sized");
-        let offset = index * elem_size;
-        assert!(
-            offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),
-            "sanity check: the indexed offset should not be outside what the type allows."
-        );
+        let elem_layout = elem_ty.layout::<M::T>();
+        let ptr = if elem_layout.is_extern_ref() {
+            // Indexing into an externref array offsets the pointer in slot units.
+            let elem_slots = elem_layout.expect_slots("externref array elements have a static slot count");
+            self.table_ptr_offset_inbounds(root.ptr.thin_pointer, index * elem_slots)?
+        } else {
+            let elem_size = elem_layout.expect_size("WF ensures array & slice elements are sized");
+            let offset = index * elem_size;
+            assert!(
+                offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),
+                "sanity check: the indexed offset should not be outside what the type allows."
+            );
 
-        let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+            self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?
+        };
         ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
     }
 

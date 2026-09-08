@@ -89,6 +89,10 @@ pub enum Type {
     },
     /// A `dyn TraitName`. Commonly only used behind a pointer.
     TraitObject(TraitName),
+    /// A wasm-style `externref`: an opaque reference provided by the host.
+    /// Values of this type (and arrays of it) live in the externref table
+    /// address space, never in byte memory; the type has no byte representation.
+    ExternRef,
 }
 
 pub struct IntType {
@@ -166,15 +170,20 @@ impl Type {
                     tail: tail_ty.layout::<T>(),
                 },
             },
-            Array { elem, count } => Sized(
-                elem.layout::<T>().expect_size("WF ensures array element is sized") * count,
-                elem.layout::<T>().expect_align("WF ensures array element is sized"),
-            ),
+            Array { elem, count } => match elem.layout::<T>() {
+                // Arrays of externref-space types live in the externref table themselves.
+                LayoutStrategy::ExternRefSized(slots) => LayoutStrategy::ExternRefSized(slots * count),
+                elem_layout => Sized(
+                    elem_layout.expect_size("WF ensures array element is sized") * count,
+                    elem_layout.expect_align("WF ensures array element is sized"),
+                ),
+            },
             Slice { elem } => LayoutStrategy::Slice(
                 elem.layout::<T>().expect_size("WF ensures slice element is sized"),
                 elem.layout::<T>().expect_align("WF ensures array element is sized"),
             ),
             TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),
+            ExternRef => LayoutStrategy::ExternRefSized(libspecr::Int::ONE),
         }
     }
 
@@ -232,15 +241,23 @@ impl TupleHeadLayout {
 }
 
 impl LayoutStrategy {
+    /// Whether the size of this type (in the units of its address space) is statically known.
+    /// Note that this is `true` for externref-space types: they are `Sized` in the
+    /// Rust sense, they just have no *byte* size (see `is_extern_ref`).
     pub fn is_sized(self) -> bool {
-        matches!(self, LayoutStrategy::Sized(..))
+        matches!(self, LayoutStrategy::Sized(..) | LayoutStrategy::ExternRefSized(..))
+    }
+
+    /// Whether this layout lives in the externref table address space.
+    pub fn is_extern_ref(self) -> bool {
+        matches!(self, LayoutStrategy::ExternRefSized(..))
     }
 
     /// Returns the size when the type must be statically sized.
     pub fn expect_size(self, msg: &str) -> Size {
         match self {
             LayoutStrategy::Sized(size, _) => size,
-            _ => panic!("expect_size called on unsized type: {msg}"),
+            _ => panic!("expect_size called on unsized or externref type: {msg}"),
         }
     }
 
@@ -248,7 +265,15 @@ impl LayoutStrategy {
     pub fn expect_align(self, msg: &str) -> Align {
         match self {
             LayoutStrategy::Sized(_, align) => align,
-            _ => panic!("expect_align called on unsized type: {msg}"),
+            _ => panic!("expect_align called on unsized or externref type: {msg}"),
+        }
+    }
+
+    /// Returns the slot count of an externref-space layout.
+    pub fn expect_slots(self, msg: &str) -> Int {
+        match self {
+            LayoutStrategy::ExternRefSized(count) => count,
+            _ => panic!("expect_slots called on non-externref layout: {msg}"),
         }
     }
 
@@ -284,6 +309,7 @@ impl LayoutStrategy {
             LayoutStrategy::Slice(..) => PointerMetaKind::ElementCount,
             LayoutStrategy::TraitObject(trait_name) => PointerMetaKind::VTablePointer(trait_name),
             LayoutStrategy::Tuple { tail, .. } => tail.meta_kind(),
+            LayoutStrategy::ExternRefSized(..) => PointerMetaKind::None,
         }
     }
 }

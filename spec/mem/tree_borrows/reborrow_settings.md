@@ -101,6 +101,11 @@ impl ReborrowSettings {
         let Some(pointee_info) = ptr_type.safe_pointee() else {
             return None;
         };
+        if pointee_info.layout.is_extern_ref() {
+            // Pointers into the externref table are not retagged.
+            // TODO: slot-granular Tree Borrows for the externref table (aliasing model deferred).
+            return None;
+        }
         if matches!(ptr_type, PtrType::Ref { mutbl: Mutability::Mutable, pointee } | PtrType::Box { pointee } if !pointee.unpin) {
             // Mutable reference / Box to pinning type: retagging is a NOP.
             // FIXME: with `UnsafePinned`, this should do proper per-byte tracking.

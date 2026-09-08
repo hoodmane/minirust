@@ -23,6 +23,7 @@ pub fn from_frozen_layout(layout: LayoutStrategy) -> UnsafeCellStrategy {
                 head_cells: List::new(),
                 tail_cells: GcCow::new(from_frozen_layout(tail.extract())),
             },
+        LayoutStrategy::ExternRefSized(..) => UnsafeCellStrategy::ExternRef,
     }
 }
 
@@ -97,6 +98,10 @@ pub fn slice_ty(elem: Type) -> Type {
 
 pub fn trait_object_ty(trait_name: TraitName) -> Type {
     Type::TraitObject(trait_name)
+}
+
+pub fn extern_ref_ty() -> Type {
+    Type::ExternRef
 }
 
 pub fn enum_variant(ty: Type, tagger: &[(Offset, (IntType, Int))]) -> Variant {
