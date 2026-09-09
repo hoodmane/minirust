@@ -54,6 +54,11 @@ impl LayoutStrategy {
                 tail.check_wf::<T>(prog)?;
                 ensure_wf(!tail.is_sized(), "LayoutStrategy: tuple with sized tail")?;
             }
+            LayoutStrategy::ExternRefSized(count) => {
+                // Slot counts are bounded like byte sizes, so that slot indices
+                // (which are pointer addresses) behave like ordinary addresses.
+                ensure_wf(count >= 0 && T::valid_size(Size::from_bytes(count).unwrap()), "LayoutStrategy: invalid externref slot count")?;
+            }
         };
 
         ret(())
@@ -71,6 +76,8 @@ impl LayoutStrategy {
             LayoutStrategy::TraitObject(..) => (),
             // The size and align computation aligns the size of the full tuple.
             LayoutStrategy::Tuple { tail, .. } => tail.check_aligned()?,
+            // Table slots have no alignment requirements.
+            LayoutStrategy::ExternRefSized(..) => (),
         };
 
         ret(())
@@ -101,6 +108,8 @@ impl UnsafeCellStrategy {
                 Self::check_cells(head_cells, head.end)?;
                 tail_cells.check_wf::<T>(tail)?;
             },
+            // There are no byte-level UnsafeCells in the externref table.
+            (UnsafeCellStrategy::ExternRef, LayoutStrategy::ExternRefSized(..)) => {},
             _ => {
                 ensure_wf(false, "UnsafeCellStrategy and LayoutStrategy variants do not match")?;
             },
@@ -158,6 +167,9 @@ impl Type {
                     // Ensure it fits after the one we previously checked.
                     ensure_wf(offset >= last_end, "Type::Tuple: overlapping fields")?;
                     ensure_wf(ty.layout::<T>().is_sized(), "Type::Tuple: unsized field type in head")?;
+                    // Externref-space types have no byte layout, so they cannot be tuple fields.
+                    // (Store a pointer to the externref table instead.)
+                    ensure_wf(!ty.layout::<T>().is_extern_ref(), "Type::Tuple: externref field type")?;
                     last_end = offset + ty.layout::<T>().expect_size("ensured to be sized above");
                 }
                 // The unsized field must actually be unsized.
@@ -176,18 +188,26 @@ impl Type {
             }
             Array { elem, count } => {
                 ensure_wf(count >= 0, "Type::Array: negative amount of elements")?;
-                ensure_wf(elem.layout::<T>().is_sized(), "Type::Array: unsized element type")?;
+                // The element type must be checked before we may call `layout()` on it.
                 elem.check_wf::<T>(prog)?;
+                ensure_wf(elem.layout::<T>().is_sized(), "Type::Array: unsized element type")?;
             }
             Slice { elem } => {
-                ensure_wf(elem.layout::<T>().is_sized(), "Type::Slice: unsized element type")?;
+                // The element type must be checked before we may call `layout()` on it.
                 elem.check_wf::<T>(prog)?;
+                // Slices of externref are not supported (only arrays `[externref; N]` are).
+                // Supporting them would require a second unsized layout variant with
+                // slot-unit dispatch in the metadata and deref paths.
+                ensure_wf(!elem.layout::<T>().is_extern_ref(), "Type::Slice: externref element type")?;
+                ensure_wf(elem.layout::<T>().is_sized(), "Type::Slice: unsized element type")?;
             }
             Union { fields, size, chunks, align: _ } => {
                 // The fields may overlap, but they must all fit the size.
                 for (offset, ty) in fields {
                     ty.check_wf::<T>(prog)?;
                     ensure_wf(ty.layout::<T>().is_sized(), "Type::Union: unsized field type")?;
+                    // Externref-space types have no byte layout, so they cannot be union fields.
+                    ensure_wf(!ty.layout::<T>().is_extern_ref(), "Type::Union: externref field type")?;
                     ensure_wf(
                         size >= offset + ty.layout::<T>().expect_size("ensured to be sized above"),
                         "Type::Union: field size does not fit union",
@@ -224,6 +244,8 @@ impl Type {
                     )?;
 
                     variant.ty.check_wf::<T>(prog)?;
+                    // Externref-space types have no byte layout, so they cannot be enum variants.
+                    ensure_wf(!variant.ty.layout::<T>().is_extern_ref(), "Type::Enum: externref variant type")?;
                     let LayoutStrategy::Sized(var_size, var_align) = variant.ty.layout::<T>() else {
                         throw_ill_formed!("Type::Enum: variant type is unsized")
                     };
@@ -245,6 +267,7 @@ impl Type {
             TraitObject(trait_name) => {
                 ensure_wf(prog.traits.contains_key(trait_name), "Type::TraitObject: trait name doesn't exist")?;
             }
+            ExternRef => (),
         }
 
         // Now that we know the type is well-formed,
@@ -305,7 +328,10 @@ impl Constant {
             }
             (Constant::FnPointer(fn_name), Type::Ptr(ptr_ty)) => {
                 ensure_wf(matches!(ptr_ty, PtrType::FnPtr), "Constant::FnPointer: non function pointer type")?;
-                ensure_wf(prog.functions.contains_key(fn_name), "Constant::FnPointer: invalid function name")?;
+                ensure_wf(
+                    prog.functions.contains_key(fn_name) || prog.extern_functions.contains_key(fn_name),
+                    "Constant::FnPointer: invalid function name"
+                )?;
             }
             (Constant::VTablePointer(vtable_name), Type::Ptr(ptr_ty)) => {
                 let Some(vtable) = prog.vtables.get(vtable_name) else {
@@ -338,6 +364,9 @@ impl ValueExpr {
             }
             Tuple(exprs, t) => {
                 t.check_wf::<T>(prog)?;
+                // There are no values of externref-space types, so in particular
+                // no aggregates of type `[externref; N]` can be built.
+                ensure_wf(!t.layout::<T>().is_extern_ref(), "ValueExpr::Tuple: externref type")?;
 
                 match t {
                     Type::Tuple { sized_fields, unsized_field, .. } => {
@@ -397,6 +426,9 @@ impl ValueExpr {
             Load { source } => {
                 let val_ty = source.check_wf::<T>(locals, prog)?;
                 ensure_wf(val_ty.layout::<T>().is_sized(), "ValueExpr::Load: unsized value type")?;
+                // There are no values of externref-space types: raw externrefs never
+                // enter the program, they only exist inside table slots.
+                ensure_wf(!val_ty.layout::<T>().is_extern_ref(), "ValueExpr::Load: externref type")?;
                 val_ty
             }
             AddrOf { target, ptr_ty } => {
@@ -431,6 +463,9 @@ impl ValueExpr {
                                 Type::Int(int_ty)
                             }
                             Transmute(new_ty) => {
+                                // Externref values have no byte representation, so they cannot be transmuted.
+                                ensure_wf(!operand.layout::<T>().is_extern_ref(), "Cast::Transmute: externref source type")?;
+                                ensure_wf(!new_ty.layout::<T>().is_extern_ref(), "Cast::Transmute: externref target type")?;
                                 ensure_wf(operand.layout::<T>().is_sized(), "Cast::Transmute: unsized source type")?;
                                 ensure_wf(new_ty.layout::<T>().is_sized(), "Cast::Transmute: unsized target type")?;
                                 new_ty
@@ -450,6 +485,8 @@ impl ValueExpr {
                     }
                     ComputeSize(ty) | ComputeAlign(ty) => {
                         ty.check_wf::<T>(prog)?;
+                        // Externref-space types have no byte size or alignment.
+                        ensure_wf(!ty.layout::<T>().is_extern_ref(), "UnOp::ComputeSize|ComputeAlign: externref types have no size or alignment")?;
                         // A thin pointer can also be the target type, with unit metadata.
                         let meta_ty = ty.meta_kind().ty::<T>();
                         if operand != meta_ty {
@@ -741,6 +778,8 @@ impl Terminator {
                 // Return and argument expressions must all typecheck with some type.
                 let ret_ty = ret.check_wf::<T>(func.locals, prog)?;
                 ensure_wf(ret_ty.layout::<T>().is_sized(), "Terminator::Intrinsic: unsized return type")?;
+                // There are no values of externref-space types, so nothing can be returned at such a type.
+                ensure_wf(!ret_ty.layout::<T>().is_extern_ref(), "Terminator::Intrinsic: externref return type")?;
                 for arg in arguments {
                     let arg_ty = arg.check_wf::<T>(func.locals, prog)?;
                     ensure_wf(arg_ty.layout::<T>().is_sized(), "Terminator::Intrinsic: unsized argument type")?;
@@ -765,11 +804,16 @@ impl Terminator {
                 ensure_wf(matches!(ty, Type::Ptr(PtrType::FnPtr)), "Terminator::Call: invalid type")?;
 
                 // Return and argument expressions must all typecheck with some sized type.
+                // There are no values of externref-space types, so they cannot be passed
+                // or returned: extern functions taking raw externrefs are invoked with
+                // pointers to table slots instead (see the extern call shim).
                 let ret_ty = ret.check_wf::<T>(func.locals, prog)?;
                 ensure_wf(ret_ty.layout::<T>().is_sized(), "Terminator::Call: unsized return type")?;
+                ensure_wf(!ret_ty.layout::<T>().is_extern_ref(), "Terminator::Call: externref return type")?;
                 for arg in arguments {
                     let arg_ty = arg.check_wf::<T>(func.locals, prog)?;
                     ensure_wf(arg_ty.layout::<T>().is_sized(), "Terminator::Call: unsized argument type")?;
+                    ensure_wf(!arg_ty.layout::<T>().is_extern_ref(), "Terminator::Call: externref argument type")?;
                 }
 
                 if let Some(next_block) = next_block {
@@ -812,21 +856,27 @@ impl Terminator {
 impl Function {
     fn check_wf<T: Target>(self, prog: Program) -> Result<()> {
         // Ensure all locals have a valid type.
+        // The type must be checked before we may call `layout()` on it
+        // (e.g. `layout()` panics on slices of unsized types).
         for ty in self.locals.values() {
-            ensure_wf(ty.layout::<T>().is_sized(), "Function: unsized local variable")?;
             ty.check_wf::<T>(prog)?;
+            ensure_wf(ty.layout::<T>().is_sized(), "Function: unsized local variable")?;
         }
 
         // Compute initially live locals: arguments and return values.
         // They must all exist and be distinct.
+        // Since there are no values of externref-space types, they cannot be passed
+        // or returned; only plain (address-taken) locals may have such types.
         let mut start_live: Set<LocalName> = Set::new();
         for arg in self.args {
             ensure_wf(self.locals.contains_key(arg), "Function: argument local does not exist")?;
+            ensure_wf(!self.locals[arg].layout::<T>().is_extern_ref(), "Function: externref argument or return type")?;
             if start_live.try_insert(arg).is_err() {
                 throw_ill_formed!("Function: two arguments refer to the same local");
             };
         }
         ensure_wf(self.locals.contains_key(self.ret), "Function: return local does not exist")?;
+        ensure_wf(!self.locals[self.ret].layout::<T>().is_extern_ref(), "Function: externref argument or return type")?;
         if start_live.try_insert(self.ret).is_err() {
             throw_ill_formed!("Function: return local is also used for an argument");
         };
@@ -872,6 +922,31 @@ impl Function {
     }
 }
 
+impl ExternFunction {
+    fn check_wf<T: Target>(self, prog: Program) -> Result<()> {
+        // Check the argument types. Raw externrefs and table pointers may occur in any
+        // argument position; everything else must be an ordinary sized non-externref type
+        // (raw externrefs must be declared via `ExternTy::ExternRef`, not `ExternTy::Other`).
+        for arg in self.args {
+            if let ExternTy::Other(ty) = arg {
+                ty.check_wf::<T>(prog)?;
+                ensure_wf(ty.layout::<T>().is_sized(), "ExternFunction: unsized argument type")?;
+                ensure_wf(!ty.layout::<T>().is_extern_ref(), "ExternFunction: externref type in argument")?;
+            }
+        }
+        // The minimal deterministic host can only produce externrefs (raw or behind a
+        // pointer); any other return type must be unit.
+        if let ExternTy::Other(ty) = self.ret {
+            ty.check_wf::<T>(prog)?;
+            ensure_wf(
+                ty.layout::<T>() == LayoutStrategy::Sized(Size::ZERO, Align::ONE),
+                "ExternFunction: unsupported return type"
+            )?;
+        }
+        ret(())
+    }
+}
+
 impl Relocation {
     // Checks whether the relocation is within bounds.
     fn check_wf(self, globals: Map<GlobalName, Global>) -> Result<()> {
@@ -904,6 +979,17 @@ impl Program {
         // Check all the functions.
         for function in self.functions.values() {
             function.check_wf::<T>(self)?;
+        }
+
+        // Check all the extern functions.
+        // They share the function name (and function pointer) namespace with `functions`,
+        // so the names must be disjoint.
+        for (fn_name, extern_function) in self.extern_functions {
+            ensure_wf(
+                !self.functions.contains_key(fn_name),
+                "Program: extern function name clashes with function"
+            )?;
+            extern_function.check_wf::<T>(self)?;
         }
 
         // Ensure the start function exists, has the right ABI, takes no arguments, and returns a 1-ZST.

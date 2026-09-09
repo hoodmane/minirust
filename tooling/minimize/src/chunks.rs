@@ -80,6 +80,7 @@ fn mark_used_bytes(ty: Type, markers: &mut [bool]) {
         }
         Type::Slice { .. } | Type::TraitObject(..) =>
             panic!("unsized types cannot be part of unions"),
+        Type::ExternRef => panic!("externref cannot be part of unions"),
     }
 }
 

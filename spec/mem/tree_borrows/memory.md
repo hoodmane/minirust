@@ -88,7 +88,8 @@ impl<T: Target> TreeBorrowsMemory<T> {
         let pointee_size = Size::from_bytes(settings.inside.len()).unwrap();
 
         // Make sure the pointer is dereferenceable.
-        self.mem.check_ptr(ptr, pointee_size)?;
+        // (Table pointers never get here: `ReborrowSettings::new` returns `None` for them.)
+        self.mem.check_ptr(ptr, pointee_size, /* table */ false)?;
         // However, ignore the result of `check_ptr`: even if pointee_size is 0, we want to create a child pointer.
         let Some((alloc_id, parent_path)) = ptr.provenance else {
             assert!(pointee_size.is_zero());
@@ -205,7 +206,7 @@ impl<T: Target> Memory for TreeBorrowsMemory<T> {
     }
 
     fn deallocate(&mut self, ptr: ThinPointer<Self::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result {
-        self.mem.deallocate(ptr, kind, size, align, |extra, path| {
+        self.mem.deallocate(ptr, kind, size, align, /* table */ false, |extra, path| {
             // Check that ptr has the permission to write the entire allocation.
             extra.root.access(Some(path), AccessKind::Write, Offset::ZERO, size)?;
 
@@ -234,8 +235,50 @@ impl<T: Target> Memory for TreeBorrowsMemory<T> {
     }
 
     fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result {
-        self.mem.check_ptr(ptr, len)?;
+        self.mem.check_ptr(ptr, len, /* table */ false)?;
         ret(())
+    }
+
+    // The externref table operations forward to the basic memory model.
+    // TODO: slot-granular Tree Borrows for the externref table (the aliasing
+    // model is deferred for table allocations; retagging table pointers is a no-op,
+    // see `ReborrowSettings::new`).
+
+    fn table_allocate(&mut self, kind: AllocationKind, count: Int) -> NdResult<ThinPointer<Self::Provenance>> {
+        // Create the root node for the tree, with slot-granular permissions.
+        // These are currently never consulted (see the TODO above).
+        let root = Node {
+            children: List::new(),
+            permissions: list![Permission::Unprot(PermissionUnprot::Unique); count],
+            protected: Protected::No,
+        };
+        let path = Path::new();
+        let extra = TreeBorrowsAllocationExtra { root };
+        self.mem.table_allocate(kind, count, path, extra)
+    }
+
+    fn table_deallocate(&mut self, ptr: ThinPointer<Self::Provenance>, kind: AllocationKind, count: Int) -> Result {
+        // The callers ensure that `count` is non-negative.
+        self.mem.deallocate(ptr, kind, Size::from_bytes(count).unwrap(), Align::ONE, /* table */ true, |_extra, _path| ret(()))
+    }
+
+    fn table_store(&mut self, ptr: ThinPointer<Self::Provenance>, slots: List<ExternRefSlot>) -> Result {
+        self.mem.table_store(ptr, slots, |_extra, _path, _offset| ret(()))
+    }
+
+    fn table_load(&mut self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result<List<ExternRefSlot>> {
+        self.mem.table_load(ptr, count, |_extra, _path, _offset| ret(()))
+    }
+
+    fn table_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result {
+        // The callers ensure that `count` is non-negative.
+        self.mem.check_ptr(ptr, Size::from_bytes(count).unwrap(), /* table */ true)?;
+        ret(())
+    }
+
+    fn is_table_provenance(&self, provenance: Self::Provenance) -> bool {
+        let (id, _path) = provenance;
+        self.mem.allocations[id.0].data.is_table()
     }
 
     fn retag_ptr(

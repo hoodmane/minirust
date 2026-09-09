@@ -42,6 +42,7 @@ pub use ty_conv::*;
 
 pub struct ProgramBuilder {
     functions: Map<FnName, Function>,
+    extern_functions: Map<FnName, ExternFunction>,
     globals: Map<GlobalName, Global>,
     vtables: Map<VTableName, VTable>,
     traits: Map<TraitName, Set<TraitMethodName>>,
@@ -55,6 +56,7 @@ impl ProgramBuilder {
     pub fn new() -> ProgramBuilder {
         ProgramBuilder {
             functions: Default::default(),
+            extern_functions: Default::default(),
             globals: Default::default(),
             vtables: Default::default(),
             traits: Default::default(),
@@ -75,6 +77,7 @@ impl ProgramBuilder {
         }
         Program {
             functions: self.functions,
+            extern_functions: self.extern_functions,
             start: start_function,
             globals: self.globals,
             traits: self.traits,
@@ -86,6 +89,15 @@ impl ProgramBuilder {
         let name = FnName(Name::from_internal(self.next_fn));
         self.next_fn += 1;
         FunctionBuilder::new(name)
+    }
+
+    /// Declare an extern (host) function with the given `extern "C"` signature.
+    pub fn declare_extern_function(&mut self, args: &[ExternTy], ret: ExternTy) -> FnName {
+        let name = FnName(Name::from_internal(self.next_fn));
+        self.next_fn += 1;
+        let f = ExternFunction { args: args.iter().cloned().collect(), ret };
+        self.extern_functions.try_insert(name, f).unwrap();
+        name
     }
 
     #[track_caller]
@@ -464,6 +476,7 @@ pub fn program_with_globals(fns: &[Function], globals: &[Global]) -> Program {
 
     Program {
         functions,
+        extern_functions: Default::default(),
         start: FnName(Name::from_internal(0)),
         globals,
         traits: Default::default(),
@@ -474,6 +487,22 @@ pub fn program_with_globals(fns: &[Function], globals: &[Global]) -> Program {
 // The first function in `fns` is the start function of the program.
 pub fn program(fns: &[Function]) -> Program {
     program_with_globals(fns, &[])
+}
+
+// The first function in `fns` is the start function of the program.
+// The extern functions get the function names following the regular functions,
+// i.e. the i-th extern function can be called as function number `fns.len() + i`.
+pub fn program_with_extern_functions(fns: &[Function], extern_fns: &[ExternFunction]) -> Program {
+    let mut prog = program(fns);
+    prog.extern_functions = extern_fns
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let name = FnName(Name::from_internal((fns.len() + i) as _));
+            (name, *f)
+        })
+        .collect();
+    prog
 }
 
 // Generates a small program with a single basic block.

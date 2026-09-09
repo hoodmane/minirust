@@ -270,15 +270,27 @@ impl<M: Memory> Machine<M> {
 
         // Then evaluate the function that will be called.
         let (callee_val, _) = self.eval_value(callee)?;
-        let callee = self.fn_from_ptr(callee_val)?;
+        let callee_name = self.fn_name_from_ptr(callee_val)?;
 
         // Then evaluate the arguments.
         // FIXME: this means if an argument reads from `ret_expr`, the contents
         // of that have already been de-initialized. Is that the intended behavior?
         let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;
 
+        // Extern functions are not executed by the machine; the call is mediated
+        // by a shim, see [below](#extern-function-calls).
+        if let Some(extern_fn) = self.prog.extern_functions.get(callee_name) {
+            return self.eval_extern_call(
+                extern_fn,
+                caller_conv,
+                arguments,
+                (ret_place, ret_ty),
+                next_block,
+            );
+        }
+
         self.eval_call(
-            callee,
+            self.prog.functions[callee_name],
             caller_conv,
             arguments,
             (ret_place, ret_ty),
@@ -291,6 +303,149 @@ impl<M: Memory> Machine<M> {
 
 Note that the content of the arguments is entirely controlled by the caller.
 The callee should probably start with a bunch of `Validate` statements to ensure that all these arguments match the type the callee thinks they should have.
+
+## Extern function calls
+
+Calls to extern (host) functions do not push a stack frame; they are mediated by a *shim* that converts between the MiniRust-level view of the signature and the raw C signature.
+The conversion rule is: every position of `ExternTy::ExternRef` (a raw `__externref_t`) is invoked with a thin pointer to an externref table slot.
+For an argument, the shim loads the raw externref out of that slot (a `table.get`) and passes it to the host.
+For the return value, the call site passes one extra *leading* out-pointer argument (like an `sret` lowering), the shim stores the host's raw result into that slot (a `table.set`), and the MiniRust-level return type is unit.
+This way, raw externrefs only ever exist inside table slots and in the shim itself -- they never become MiniRust values.
+
+All other positions are passed through unchanged.
+
+```rust
+impl ExternTy {
+    /// The MiniRust-level type at which an argument in this position is passed at the call site.
+    fn abi_ty(self) -> Type {
+        match self {
+            // Raw `__externref_t` positions are invoked with a thin pointer to a table slot.
+            ExternTy::ExternRef | ExternTy::ExternRefPtr =>
+                Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None }),
+            ExternTy::Other(ty) => ty,
+        }
+    }
+}
+```
+
+We model a minimal deterministic host: it validates and consumes its arguments, does not touch memory reachable from passed-through pointers, never unwinds (so the `unwind_block` is irrelevant), and whenever it has to produce a raw externref, it hands out a *fresh* reference, identified by incrementing a monotone counter.
+A host function declared to return `__externref_t*` returns a pointer to a fresh host-allocated slot in the heap region of the table (which the program may later deallocate like a slot it allocated itself).
+
+```rust
+impl<M: Memory> Machine<M> {
+    /// Mint a fresh (non-null) host reference.
+    fn fresh_extern_ref(&mut self) -> ExternRef {
+        let r = Some(self.extern_ref_count);
+        self.extern_ref_count += 1;
+        r
+    }
+
+    /// Perform a call to an extern function: check the ABI, run the shim conversions
+    /// around the (minimal, deterministic) host, and store the result.
+    /// The checks mirror `create_frame`.
+    fn eval_extern_call(
+        &mut self,
+        extern_fn: ExternFunction,
+        caller_conv: CallingConvention,
+        arguments: List<(Value<M>, Type)>,
+        caller_ret: (Place<M>, Type),
+        next_block: Option<BbName>,
+    ) -> NdResult {
+        let (caller_ret_place, caller_ret_ty) = caller_ret;
+
+        // Check calling convention; extern functions are always `extern "C"`.
+        if caller_conv != CallingConvention::C {
+            throw_ub!("call ABI violation: calling conventions are not the same");
+        }
+
+        // Check return place compatibility.
+        // A raw externref return is lowered to a leading out-pointer argument,
+        // so the MiniRust-level return type is unit.
+        let ret_abi_ty = match extern_fn.ret {
+            ExternTy::ExternRef => unit_type(),
+            _ => extern_fn.ret.abi_ty(),
+        };
+        if !check_abi_compatibility(caller_ret_ty, ret_abi_ty) {
+            throw_ub!("call ABI violation: return types are not compatible");
+        }
+
+        // Check the argument count, accounting for the out-pointer.
+        let has_out_ptr = matches!(extern_fn.ret, ExternTy::ExternRef);
+        let num_args = extern_fn.args.len() + if has_out_ptr { 1 } else { 0 };
+        if num_args != arguments.len() {
+            throw_ub!("call ABI violation: number of arguments does not agree");
+        }
+
+        // Split off the out-pointer, if any.
+        let (out_ptr, arguments) = if has_out_ptr {
+            let (out_val, out_ty) = arguments[Int::ZERO];
+            if !check_abi_compatibility(out_ty, Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })) {
+                throw_ub!("call ABI violation: argument types are not compatible");
+            }
+            let Value::Ptr(ptr) = out_val else {
+                panic!("well-formed value of pointer type must be Value::Ptr");
+            };
+            (Some(ptr.thin_pointer), arguments.subslice_with_length(Int::ONE, extern_fn.args.len()))
+        } else {
+            (None, arguments)
+        };
+
+        // Check the remaining arguments and run the shim conversions on them.
+        for (decl_ty, (caller_val, caller_ty)) in extern_fn.args.zip(arguments) {
+            // Make sure caller and callee view of this are compatible.
+            if !check_abi_compatibility(caller_ty, decl_ty.abi_ty()) {
+                throw_ub!("call ABI violation: argument types are not compatible");
+            }
+            if matches!(decl_ty, ExternTy::ExternRef) {
+                // The shim performs the `table.get` that produces the raw argument.
+                let Value::Ptr(ptr) = caller_val else {
+                    panic!("well-formed value of pointer type must be Value::Ptr");
+                };
+                let slots = self.mem.table_load(ptr.thin_pointer, Int::ONE, Atomicity::None)?;
+                let ExternRefSlot::Init(_raw) = slots[Int::ZERO] else {
+                    throw_ub!("load of an uninitialized externref slot");
+                };
+                // The minimal host just consumes `_raw`.
+            }
+            // All other arguments are passed through; the minimal host ignores them.
+        }
+
+        // Produce the host's result and run the shim conversion on it.
+        let (ret_val, ret_ty) = match extern_fn.ret {
+            ExternTy::ExternRef => {
+                // The shim performs the `table.set` of the raw result into the out-slot.
+                let r = self.fresh_extern_ref();
+                self.mem.table_store(out_ptr.unwrap(), list![ExternRefSlot::Init(r)], Atomicity::None)?;
+                (unit_value::<M>(), unit_type())
+            }
+            ExternTy::ExternRefPtr => {
+                // The host returns a pointer to a fresh slot in the heap region of the table.
+                let ptr = self.mem.table_allocate(AllocationKind::Heap, Int::ONE)?;
+                let r = self.fresh_extern_ref();
+                self.mem.table_store(ptr, list![ExternRefSlot::Init(r)], Atomicity::None)?;
+                (Value::Ptr(ptr.widen(None)), Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None }))
+            }
+            ExternTy::Other(_) => {
+                // WF ensures a pass-through return type is unit.
+                (unit_value::<M>(), unit_type())
+            }
+        };
+
+        // Store the return value where the caller wanted it, like `Return` does.
+        let align = ret_ty.layout::<M::T>().expect_align("the shim return types are sized");
+        self.typed_store(caller_ret_place.ptr.thin_pointer, ret_val, ret_ty, align, Atomicity::None)?;
+
+        // Jump to where the caller wants us to jump.
+        if let Some(next_block) = next_block {
+            self.jump_to_block(next_block)?;
+        } else {
+            throw_ub!("return from a function where caller did not specify next block");
+        }
+
+        ret(())
+    }
+}
+```
 
 ## Return
 

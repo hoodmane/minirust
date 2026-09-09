@@ -457,6 +457,23 @@ impl Type {
 }
 ```
 
+### Externref
+
+Externref-space types (`externref` itself and arrays of it) have no byte representation, and there are no MiniRust values of these types at all:
+well-formedness ensures that externref-typed places are never loaded from or stored to.
+Raw externrefs exist only inside externref table slots, manipulated by the externref intrinsics and by the shims around extern function calls, so these arms are unreachable.
+
+```rust
+impl Type {
+    fn decode<M: Memory>(Type::ExternRef: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+        panic!("decode of Type::ExternRef: externref types have no byte representation")
+    }
+    fn encode<M: Memory>(Type::ExternRef: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+        panic!("encode of Type::ExternRef: externref types have no byte representation")
+    }
+}
+```
+
 ## Well-formed values
 
 We call a value `val` *well-formed* for a type `ty` if `machine.check_value(val, ty).is_ok()`.
@@ -510,6 +527,20 @@ impl<M: Memory> Machine<M> {
 
         // Safe pointer, i.e. references, boxes
         if let Some(pointee) = ptr_ty.safe_pointee() {
+            if pointee.layout.is_extern_ref() {
+                // A safe pointer into the externref table address space.
+                // Table slots have no alignment requirements, and slot indices are
+                // bounded by the table, so only non-nullness, inhabitedness, and
+                // dereferenceability (in the table address space) remain to be checked.
+                let slots = pointee.layout.expect_slots("externref pointees have a static slot count");
+                ensure_else_ub(ptr.thin_pointer.addr != 0, "Value::Ptr: null safe pointer")?;
+                ensure_else_ub(pointee.inhabited, "Value::Ptr: safe pointer to uninhabited type")?;
+                ensure_else_ub(
+                    self.mem.table_dereferenceable(ptr.thin_pointer, slots).is_ok(),
+                    "Value::Ptr: non-dereferenceable safe pointer"
+                )?;
+                return Ok(());
+            }
             let size = self.compute_size(pointee.layout, ptr.metadata);
             let align = self.compute_align(pointee.layout, ptr.metadata);
             // The total size must be at most `isize::MAX`.
@@ -600,6 +631,8 @@ impl<M: Memory> Machine<M> {
     fn typed_store(&mut self, ptr: ThinPointer<M::Provenance>, val: Value<M>, ty: Type, align: Align, atomicity: Atomicity) -> Result {
         // All values floating around in MiniRust must be well-formed.
         assert!(self.check_value(val, ty).is_ok(), "trying to store {val:?} which is ill-formed for {:#?}", ty);
+        // There are no values of externref-space types; WF ensures such places are never stored to.
+        assert!(!ty.layout::<M::T>().is_extern_ref(), "typed_store of an externref-space type");
         let bytes = ty.encode::<M>(val);
         self.mem.store(ptr, bytes, align, atomicity)?;
 
@@ -607,6 +640,8 @@ impl<M: Memory> Machine<M> {
     }
 
     fn typed_load(&mut self, ptr: ThinPointer<M::Provenance>, ty: Type, align: Align, atomicity: Atomicity) -> Result<Value<M>> {
+        // There are no values of externref-space types; WF ensures such places are never loaded from.
+        assert!(!ty.layout::<M::T>().is_extern_ref(), "typed_load of an externref-space type");
         let bytes = self.mem.load(ptr, ty.layout::<M::T>().expect_size("the callers ensure `ty` is sized"), align, atomicity)?;
         ret(match ty.decode::<M>(bytes) {
             Some(val) => {

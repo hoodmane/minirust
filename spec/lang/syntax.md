@@ -439,6 +439,18 @@ pub enum IntrinsicOp {
     PointerWithExposedProvenance,
     /// Access the current unwinding payload. UB if not currently unwinding.
     GetUnwindPayload,
+    /// Allocate a fresh range of uninitialized externref table slots in the heap
+    /// region of the table. Returns a table pointer to the first slot.
+    ExternRefAllocate,
+    /// Deallocate a range of externref table slots allocated by `ExternRefAllocate`.
+    ExternRefDeallocate,
+    /// Copy the contents of one externref table slot to another
+    /// (a fused `table.get` + `table.set`; the raw externref never enters the program).
+    ExternRefCopy,
+    /// Store the null externref into a table slot.
+    ExternRefWriteNull,
+    /// Check whether the externref stored in a table slot is null.
+    ExternRefIsNull,
 }
 ```
 
@@ -458,6 +470,9 @@ pub struct TraitMethodName(pub libspecr::Name);
 pub struct Program {
     /// Associate a function with each declared function name.
     pub functions: Map<FnName, Function>,
+    /// Extern (host) functions, declared in an `extern "C"` block.
+    /// They share the function name and function pointer namespace with `functions`.
+    pub extern_functions: Map<FnName, ExternFunction>,
     /// The function where execution starts.
     pub start: FnName,
     /// Associate each global name with the associated global.
@@ -490,6 +505,31 @@ pub struct Function {
 
     /// Whether implicit writes are enabled for this function.
     pub implicit_writes: bool,
+}
+
+/// The type of one argument or return position in an `extern "C"` signature.
+/// This is the only place where a raw `__externref_t` can occur in a MiniRust program:
+/// spec-defined shims around the call convert between raw externrefs and table pointers,
+/// so the raw value never enters the program.
+pub enum ExternTy {
+    /// A raw `__externref_t`, converted by the shim.
+    /// At the MiniRust call site, an argument in this position is passed as a thin
+    /// pointer to a table slot and the shim performs the `table.get`. A return in this
+    /// position becomes one extra *leading* out-pointer argument (like an `sret`
+    /// lowering) and the shim performs the `table.set`; the MiniRust-level return type
+    /// is then unit.
+    ExternRef,
+    /// A `__externref_t*`: a table pointer, passed through unchanged.
+    ExternRefPtr,
+    /// Any ordinary sized MiniRust type, passed through unchanged.
+    Other(Type),
+}
+
+/// An extern (host) function that can be called by a MiniRust program but is not
+/// defined by it. Extern functions always use the `C` calling convention.
+pub struct ExternFunction {
+    pub args: List<ExternTy>,
+    pub ret: ExternTy,
 }
 
 /// A basic block is a sequence of statements followed by a terminator.

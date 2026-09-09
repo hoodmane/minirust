@@ -36,6 +36,11 @@ pub struct Machine<M: Memory> {
     /// The Locks
     locks: List<LockState>,
 
+    /// Counts how many externref handles the host has handed out so far.
+    /// Calling an extern function that returns a raw `__externref_t` (or a pointer
+    /// to one) mints a fresh host reference by incrementing this counter.
+    extern_ref_count: Int,
+
     /// Stores a pointer to each of the global allocations, which are all `Sized`.
     global_ptrs: Map<GlobalName, ThinPointer<M::Provenance>>,
 
@@ -164,6 +169,12 @@ impl<M: Memory> Machine<M> {
             fn_ptrs.insert(fn_name, alloc);
         }
 
+        // Allocate extern functions; they share the function pointer namespace.
+        for (fn_name, _extern_function) in prog.extern_functions {
+            let alloc = mem.allocate(AllocationKind::Function, Size::ZERO, Align::ONE)?;
+            fn_ptrs.insert(fn_name, alloc);
+        }
+
         // Allocate vtables.
         for (vtable_name, _vtable) in prog.vtables {
             let alloc = mem.allocate(AllocationKind::VTable, Size::ZERO, Align::ONE)?;
@@ -180,6 +191,7 @@ impl<M: Memory> Machine<M> {
             vtable_ptrs,
             threads: list![],
             locks: List::new(),
+            extern_ref_count: Int::ZERO,
             active_thread: ThreadId::ZERO,
             synchronized_threads: Set::new(),
             stdout,
@@ -328,8 +340,9 @@ impl<M: Memory> Machine<M> {
         ret(thread_id)
     }
 
-    /// Look up a function given a pointer.
-    fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {
+    /// Look up a function name given a pointer.
+    /// The name can refer to either a MiniRust function or an extern function.
+    fn fn_name_from_ptr(&self, ptr: Value<M>) -> Result<FnName> {
         if let Value::Ptr(Pointer { thin_pointer: thin_ptr, metadata }) = ptr {
             if metadata.is_some() {
                 throw_ub!("invalid pointer for function lookup");
@@ -337,7 +350,7 @@ impl<M: Memory> Machine<M> {
             let Some((func_name, _)) = self.fn_ptrs.iter().find(|(_, fn_ptr)| *fn_ptr == thin_ptr) else {
                 throw_ub!("invalid pointer for function lookup");
             };
-            ret(self.prog.functions[func_name])
+            ret(func_name)
         } else {
             throw_ub!("trying to look up a function based on a non-pointer value");
         }

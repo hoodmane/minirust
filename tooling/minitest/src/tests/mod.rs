@@ -19,6 +19,7 @@ mod enum_discriminant;
 mod enum_downcast;
 mod enum_representation;
 mod expose;
+mod extern_ref;
 mod heap_intrinsics;
 mod ill_formed;
 mod int;

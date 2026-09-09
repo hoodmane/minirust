@@ -48,6 +48,14 @@ impl<M: Memory> Machine<M> {
         if ret_ty != Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE }) {
             throw_ub!("invalid return type for `PointerExposeProvenance` intrinsic")
         }
+        // Externref table pointers do not support integer casts: their provenance can
+        // never be exposed, which also means `PointerWithExposedProvenance` can never
+        // conjure a pointer into the table address space.
+        if let Some(provenance) = ptr.provenance {
+            if self.mem.is_table_provenance(provenance) {
+                throw_ub!("exposing the provenance of an externref table pointer");
+            }
+        }
 
         self.intptrcast.expose(ptr);
         ret(Value::Int(ptr.addr))
@@ -280,6 +288,155 @@ impl<M: Memory> Machine<M> {
 }
 ```
 
+## Externref operations
+
+These intrinsics define the operation surface for externref table slots.
+Since raw externrefs never enter the program (see [extern function calls](terminators.md#extern-function-calls)), all of them operate on *table pointers*: thin pointers into the externref table address space.
+The only sources of non-null raw externrefs are extern function calls; the intrinsics can copy slot contents around (`ExternRefCopy`, a fused `table.get` + `table.set`), overwrite a slot with the null externref (`ExternRefWriteNull`), and test a slot's content for null-ness (`ExternRefIsNull`).
+There is deliberately no equality test and no other way to inspect a slot.
+
+```rust
+impl<M: Memory> Machine<M> {
+    fn eval_intrinsic(
+        &mut self,
+        IntrinsicOp::ExternRefCopy: IntrinsicOp,
+        arguments: List<(Value<M>, Type)>,
+        ret_ty: Type,
+    ) -> NdResult<Value<M>> {
+        if arguments.len() != 2 {
+            throw_ub!("invalid number of arguments for `ExternRefCopy` intrinsic");
+        }
+        let Value::Ptr(Pointer { thin_pointer: dst, metadata: None }) = arguments[0].0 else {
+            throw_ub!("invalid first argument to `ExternRefCopy` intrinsic: not a thin pointer");
+        };
+        let Value::Ptr(Pointer { thin_pointer: src, metadata: None }) = arguments[1].0 else {
+            throw_ub!("invalid second argument to `ExternRefCopy` intrinsic: not a thin pointer");
+        };
+        if ret_ty != unit_type() {
+            throw_ub!("invalid return type for `ExternRefCopy` intrinsic")
+        }
+
+        let slots = self.mem.table_load(src, Int::ONE, Atomicity::None)?;
+        let ExternRefSlot::Init(_) = slots[Int::ZERO] else {
+            throw_ub!("load of an uninitialized externref slot");
+        };
+        self.mem.table_store(dst, slots, Atomicity::None)?;
+
+        ret(unit_value())
+    }
+
+    fn eval_intrinsic(
+        &mut self,
+        IntrinsicOp::ExternRefWriteNull: IntrinsicOp,
+        arguments: List<(Value<M>, Type)>,
+        ret_ty: Type,
+    ) -> NdResult<Value<M>> {
+        if arguments.len() != 1 {
+            throw_ub!("invalid number of arguments for `ExternRefWriteNull` intrinsic");
+        }
+        let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+            throw_ub!("invalid first argument to `ExternRefWriteNull` intrinsic: not a thin pointer");
+        };
+        if ret_ty != unit_type() {
+            throw_ub!("invalid return type for `ExternRefWriteNull` intrinsic")
+        }
+
+        self.mem.table_store(ptr, list![ExternRefSlot::Init(None)], Atomicity::None)?;
+
+        ret(unit_value())
+    }
+
+    fn eval_intrinsic(
+        &mut self,
+        IntrinsicOp::ExternRefIsNull: IntrinsicOp,
+        arguments: List<(Value<M>, Type)>,
+        ret_ty: Type,
+    ) -> NdResult<Value<M>> {
+        if arguments.len() != 1 {
+            throw_ub!("invalid number of arguments for `ExternRefIsNull` intrinsic");
+        }
+        let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+            throw_ub!("invalid first argument to `ExternRefIsNull` intrinsic: not a thin pointer");
+        };
+        if ret_ty != Type::Bool {
+            throw_ub!("invalid return type for `ExternRefIsNull` intrinsic")
+        }
+
+        let slots = self.mem.table_load(ptr, Int::ONE, Atomicity::None)?;
+        let ExternRefSlot::Init(r) = slots[Int::ZERO] else {
+            throw_ub!("load of an uninitialized externref slot");
+        };
+
+        ret(Value::Bool(r.is_none()))
+    }
+}
+```
+
+The "table heap" intrinsics manage heap-region externref table allocations, mirroring `Allocate`/`Deallocate` (except that table slots have no alignment, so only a slot count is passed).
+
+```rust
+impl<M: Memory> Machine<M> {
+    fn eval_intrinsic(
+        &mut self,
+        IntrinsicOp::ExternRefAllocate: IntrinsicOp,
+        arguments: List<(Value<M>, Type)>,
+        ret_ty: Type,
+    ) -> NdResult<Value<M>> {
+        if arguments.len() != 1 {
+            throw_ub!("invalid number of arguments for `ExternRefAllocate` intrinsic");
+        }
+
+        let Value::Int(count) = arguments[0].0 else {
+            throw_ub!("invalid first argument to `ExternRefAllocate` intrinsic: not an integer");
+        };
+        if count < 0 {
+            throw_ub!("invalid slot count for `ExternRefAllocate` intrinsic: negative count");
+        }
+
+        let Type::Ptr(ret_ptr_ty) = ret_ty else {
+            throw_ub!("invalid return type for `ExternRefAllocate` intrinsic");
+        };
+        if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
+            throw_ub!("unsized pointee requested for `ExternRefAllocate` intrinsic");
+        }
+
+        let alloc = self.mem.table_allocate(AllocationKind::Heap, count)?;
+
+        ret(Value::Ptr(alloc.widen(None)))
+    }
+
+    fn eval_intrinsic(
+        &mut self,
+        IntrinsicOp::ExternRefDeallocate: IntrinsicOp,
+        arguments: List<(Value<M>, Type)>,
+        ret_ty: Type,
+    ) -> NdResult<Value<M>> {
+        if arguments.len() != 2 {
+            throw_ub!("invalid number of arguments for `ExternRefDeallocate` intrinsic");
+        }
+
+        let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+            throw_ub!("invalid first argument to `ExternRefDeallocate` intrinsic: not a thin pointer");
+        };
+
+        let Value::Int(count) = arguments[1].0 else {
+            throw_ub!("invalid second argument to `ExternRefDeallocate` intrinsic: not an integer");
+        };
+        if count < 0 {
+            throw_ub!("invalid slot count for `ExternRefDeallocate` intrinsic: negative count");
+        }
+
+        if ret_ty != unit_type() {
+            throw_ub!("invalid return type for `ExternRefDeallocate` intrinsic")
+        }
+
+        self.mem.table_deallocate(ptr, AllocationKind::Heap, count)?;
+
+        ret(unit_value())
+    }
+}
+```
+
 ## Threads
 
 These intrinsics let the program spawn and join threads.
@@ -308,7 +465,11 @@ impl<M: Memory> Machine<M> {
         }
 
         let fn_ptr = arguments[0].0;
-        let func = self.fn_from_ptr(fn_ptr)?;
+        let func_name = self.fn_name_from_ptr(fn_ptr)?;
+        // A new thread needs a function body the machine can execute.
+        let Some(func) = self.prog.functions.get(func_name) else {
+            throw_ub!("spawning an extern function");
+        };
 
         let (data_ptr, data_ptr_ty) = arguments[1];
         if !matches!(data_ptr_ty, Type::Ptr(_)) {
@@ -476,7 +637,11 @@ impl<M: Memory> Machine<M> {
             throw_ub!("invalid first argument to `AtomicLoad` intrinsic: not a thin pointer");
         };
 
-        let size = ret_ty.layout::<M::T>().expect_size("WF ensures intrinsic return types are sized");
+        // WF only ensures the return type is sized; externref-space types are "sized"
+        // but have no byte size, so they must be rejected here as well.
+        let LayoutStrategy::Sized(size, _) = ret_ty.layout::<M::T>() else {
+            throw_ub!("invalid return type for `AtomicLoad` intrinsic: unsized type");
+        };
         let Some(align) = Align::from_bytes(size.bytes()) else {
             throw_ub!("invalid return type for `AtomicLoad` intrinsic: size not power of two");
         };

@@ -14,6 +14,36 @@ pub(super) fn fmt_functions(prog: Program, comptypes: &mut Vec<CompType>) -> Str
         out += &fmt_function(fn_name, f, start, comptypes);
     }
 
+    out += &fmt_extern_functions(prog, comptypes);
+
+    out
+}
+
+fn fmt_extern_ty(t: ExternTy, comptypes: &mut Vec<CompType>) -> String {
+    match t {
+        ExternTy::ExternRef => "externref".to_string(),
+        ExternTy::ExternRefPtr => "*externref".to_string(),
+        ExternTy::Other(ty) => fmt_type(ty, comptypes).to_string(),
+    }
+}
+
+pub(super) fn fmt_extern_functions(prog: Program, comptypes: &mut Vec<CompType>) -> String {
+    let mut fns: Vec<(FnName, ExternFunction)> = prog.extern_functions.iter().collect();
+
+    // Extern functions are formatted in the order given by their name.
+    fns.sort_by_key(|(FnName(name), _fn)| *name);
+
+    let mut out = String::new();
+    for (fn_name, f) in fns {
+        let args: Vec<_> = f.args.iter().map(|arg| fmt_extern_ty(arg, comptypes)).collect();
+        out += &format!(
+            "extern fn {}({}) -> {};\n\n",
+            fmt_fn_name(fn_name),
+            args.join(", "),
+            fmt_extern_ty(f.ret, comptypes),
+        );
+    }
+
     out
 }
 
@@ -253,6 +283,11 @@ fn fmt_terminator(t: Terminator, comptypes: &mut Vec<CompType>) -> String {
                 IntrinsicOp::PointerExposeProvenance => "pointer_expose_provenance",
                 IntrinsicOp::PointerWithExposedProvenance => "pointer_with_exposed_provenance",
                 IntrinsicOp::GetUnwindPayload => "get_unwind_payload",
+                IntrinsicOp::ExternRefAllocate => "extern_ref_allocate",
+                IntrinsicOp::ExternRefDeallocate => "extern_ref_deallocate",
+                IntrinsicOp::ExternRefCopy => "extern_ref_copy",
+                IntrinsicOp::ExternRefWriteNull => "extern_ref_write_null",
+                IntrinsicOp::ExternRefIsNull => "extern_ref_is_null",
             };
             let args: Vec<_> =
                 arguments.iter().map(|arg| fmt_value_expr(arg, comptypes).to_string()).collect();

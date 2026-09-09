@@ -32,6 +32,10 @@ pub struct Access {
     atomicity: Atomicity,
     addr: Address,
     len: Size,
+    /// Whether this access happened in the externref table address space.
+    /// Accesses in different address spaces never alias, even if their
+    /// addresses numerically overlap.
+    table: bool,
 }
 ```
 
@@ -67,6 +71,7 @@ impl<M: Memory> ConcurrentMemory<M> {
             atomicity,
             addr: ptr.addr,
             len: Size::from_bytes(bytes.len()).unwrap(),
+            table: false,
         };
         self.accesses.push(access);
 
@@ -80,6 +85,7 @@ impl<M: Memory> ConcurrentMemory<M> {
             atomicity,
             addr: ptr.addr,
             len,
+            table: false,
         };
         self.accesses.push(access);
 
@@ -95,6 +101,60 @@ impl<M: Memory> ConcurrentMemory<M> {
     /// A derived form of `dereferenceable` that works with a signed notion on "length".
     pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result {
         self.memory.signed_dereferenceable(ptr, len)
+    }
+
+    /// Create a new externref table allocation.
+    pub fn table_allocate(&mut self, kind: AllocationKind, count: Int) -> NdResult<ThinPointer<M::Provenance>> {
+        self.memory.table_allocate(kind, count)
+    }
+
+    /// Remove an externref table allocation.
+    pub fn table_deallocate(&mut self, ptr: ThinPointer<M::Provenance>, kind: AllocationKind, count: Int) -> Result {
+        self.memory.table_deallocate(ptr, kind, count)
+    }
+
+    /// Write some slots to the externref table and check for data races.
+    pub fn table_store(&mut self, ptr: ThinPointer<M::Provenance>, slots: List<ExternRefSlot>, atomicity: Atomicity) -> Result {
+        let access = Access {
+            ty: AccessType::Store,
+            atomicity,
+            addr: ptr.addr,
+            len: Size::from_bytes(slots.len()).unwrap(),
+            table: true,
+        };
+        self.accesses.push(access);
+
+        self.memory.table_store(ptr, slots)
+    }
+
+    /// Read some slots from the externref table and check for data races.
+    pub fn table_load(&mut self, ptr: ThinPointer<M::Provenance>, count: Int, atomicity: Atomicity) -> Result<List<ExternRefSlot>> {
+        let access = Access {
+            ty: AccessType::Load,
+            atomicity,
+            addr: ptr.addr,
+            len: Size::from_bytes(count).unwrap(),
+            table: true,
+        };
+        self.accesses.push(access);
+
+        self.memory.table_load(ptr, count)
+    }
+
+    /// Test whether the given pointer is dereferenceable for the given number of
+    /// slots in the externref table address space.
+    pub fn table_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, count: Int) -> Result {
+        self.memory.table_dereferenceable(ptr, count)
+    }
+
+    /// A derived form of `table_dereferenceable` that works with a signed notion of "count".
+    pub fn table_signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, count: Int) -> Result {
+        self.memory.table_signed_dereferenceable(ptr, count)
+    }
+
+    /// Whether this provenance belongs to an externref table allocation.
+    pub fn is_table_provenance(&self, provenance: M::Provenance) -> bool {
+        self.memory.is_table_provenance(provenance)
     }
 
     /// Return the retagged pointer.
@@ -167,6 +227,11 @@ impl Access {
 
         // At least one access is non atomic
         if self.atomicity == Atomicity::Atomic && other.atomicity == Atomicity::Atomic { return false; }
+
+        // The accesses are in the same address space.
+        // (Byte addresses and externref table slot indices are unrelated,
+        // so accesses in different spaces never alias.)
+        if self.table != other.table { return false; }
 
         // The accesses overlap.
         let end_addr = self.addr + self.len.bytes();

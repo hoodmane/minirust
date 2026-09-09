@@ -22,10 +22,22 @@ type Provenance<Extra> = (AllocId, Extra);
 
 The data tracked by the memory is fairly simple: for each allocation, we track its data contents, its absolute integer address in memory, the alignment it was created with (the size is implicit in the length of the contents), and whether it is still alive (or has already been deallocated).
 
+Allocations come in two flavors, one for each address space: ordinary byte memory, and externref table storage whose contents are whole externref values ("slots") rather than bytes.
+Both spaces share the same allocation list (and hence the same provenance), but their addresses are entirely unrelated: a byte address and a table slot index never alias, no matter their numeric values.
+
 ```rust
+enum AllocationData<ProvExtra = ()> {
+    /// Ordinary byte memory.
+    Bytes(List<AbstractByte<Provenance<ProvExtra>>>),
+    /// Externref table storage: each cell is a slot storing a whole externref value.
+    Table(List<ExternRefSlot>),
+}
+
 struct Allocation<ProvExtra = (), AllocExtra = ()> {
     /// The data stored in this allocation.
-    data: List<AbstractByte<Provenance<ProvExtra>>>,
+    /// For byte allocations, its length is measured in bytes; for externref
+    /// table allocations, in slots.
+    data: AllocationData<ProvExtra>,
     /// The address where this allocation starts.
     /// This is never 0, and `addr + data.len()` fits into a `usize`.
     addr: Address,
@@ -63,7 +75,45 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
 We start with some helper operations.
 
 ```rust
+impl<ProvExtra> AllocationData<ProvExtra> {
+    /// The number of units (bytes or table slots) stored in this allocation.
+    fn len(self) -> Int {
+        match self {
+            AllocationData::Bytes(bytes) => bytes.len(),
+            AllocationData::Table(slots) => slots.len(),
+        }
+    }
+
+    /// Whether this is externref table storage.
+    fn is_table(self) -> bool {
+        match self {
+            AllocationData::Bytes(_) => false,
+            AllocationData::Table(_) => true,
+        }
+    }
+
+    /// Extract the byte contents; the callers ensure (via `check_ptr`) that this
+    /// is a byte allocation.
+    fn expect_bytes(self, msg: &str) -> List<AbstractByte<Provenance<ProvExtra>>> {
+        match self {
+            AllocationData::Bytes(bytes) => bytes,
+            AllocationData::Table(_) => panic!("expect_bytes: {msg}"),
+        }
+    }
+
+    /// Extract the table contents; the callers ensure (via `check_ptr`) that this
+    /// is an externref table allocation.
+    fn expect_table(self, msg: &str) -> List<ExternRefSlot> {
+        match self {
+            AllocationData::Table(slots) => slots,
+            AllocationData::Bytes(_) => panic!("expect_table: {msg}"),
+        }
+    }
+}
+
 impl<ProvExtra, AllocExtra> Allocation<ProvExtra, AllocExtra> {
+    /// The size of this allocation, in the units of its address space
+    /// (bytes for byte allocations, slots for externref table allocations).
     fn size(self) -> Size {
         Size::from_bytes(self.data.len()).unwrap()
     }
@@ -89,18 +139,19 @@ Then we implement creating and removing allocations.
 
 ```rust
 impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
-    fn allocate(
+    fn allocate_inner(
         &mut self,
         kind: AllocationKind,
-        size: Size,
+        data: AllocationData<ProvExtra>,
         align: Align,
         prov_extra: ProvExtra,
         alloc_extra: AllocExtra,
     ) -> NdResult<ThinPointer<Provenance<ProvExtra>>> {
-        // Reject too large allocations. Size must fit in `isize`.
-        if !T::valid_size(size) {
-            throw_ub!("asking for a too large allocation");
-        }
+        // The size, in the units of this allocation's address space.
+        // The callers have already rejected invalid sizes.
+        let size = Size::from_bytes(data.len()).unwrap();
+        assert!(T::valid_size(size), "allocate_inner: callers ensure the size is valid");
+        let is_table = data.is_table();
         // Pick a base address. We use daemonic non-deterministic choice,
         // meaning the program has to cope with every possible choice.
         // FIXME: This makes OOM (when there is no possible choice) into "no behavior",
@@ -117,8 +168,10 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
             if !align.is_aligned(addr) { return false; }
             // ... such that addr+size is in-bounds of a `usize`...
             if !(addr+size.bytes()).in_bounds(Unsigned, T::PTR_SIZE) { return false; }
-            // ... and it does not overlap with any existing live allocation.
-            if self.allocations.any(|a| a.live && a.overlaps(addr, size)) { return false; }
+            // ... and it does not overlap with any existing live allocation in the same address space.
+            // (Byte addresses and table slot indices are unrelated, so allocations
+            // in different spaces may freely "overlap" numerically.)
+            if self.allocations.any(|a| a.live && a.data.is_table() == is_table && a.overlaps(addr, size)) { return false; }
             // If all tests pass, we are good!
             true
         })?;
@@ -129,7 +182,7 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
             align,
             kind,
             live: true,
-            data: list![AbstractByte::Uninit; size.bytes()],
+            data,
             extra: alloc_extra,
         };
 
@@ -141,12 +194,46 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         ret(ThinPointer { addr, provenance: Some((id, prov_extra)) })
     }
 
+    fn allocate(
+        &mut self,
+        kind: AllocationKind,
+        size: Size,
+        align: Align,
+        prov_extra: ProvExtra,
+        alloc_extra: AllocExtra,
+    ) -> NdResult<ThinPointer<Provenance<ProvExtra>>> {
+        // Reject too large allocations. Size must fit in `isize`.
+        // (This must happen before we materialize the contents below.)
+        if !T::valid_size(size) {
+            throw_ub!("asking for a too large allocation");
+        }
+        self.allocate_inner(kind, AllocationData::Bytes(list![AbstractByte::Uninit; size.bytes()]), align, prov_extra, alloc_extra)
+    }
+
+    fn table_allocate(
+        &mut self,
+        kind: AllocationKind,
+        count: Int,
+        prov_extra: ProvExtra,
+        alloc_extra: AllocExtra,
+    ) -> NdResult<ThinPointer<Provenance<ProvExtra>>> {
+        // The callers ensure that `count` is non-negative.
+        // Reject too large allocations. The slot count must fit in `isize`.
+        // (This must happen before we materialize the contents below.)
+        if !T::valid_size(Size::from_bytes(count).unwrap()) {
+            throw_ub!("asking for a too large allocation");
+        }
+        // Table slots have no alignment requirements, so the alignment is always 1.
+        self.allocate_inner(kind, AllocationData::Table(list![ExternRefSlot::Uninit; count]), Align::ONE, prov_extra, alloc_extra)
+    }
+
     fn deallocate(
         &mut self,
         ptr: ThinPointer<Provenance<ProvExtra>>,
         kind: AllocationKind,
         size: Size,
         align: Align,
+        table: bool,
         handle_extra: impl FnOnce(&mut AllocExtra, ProvExtra) -> Result,
     ) -> Result {
         let Some((id, prov_extra)) = ptr.provenance else {
@@ -158,6 +245,13 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         // Check a bunch of things.
         if !allocation.live {
             throw_ub!("double-free");
+        }
+        // Deallocation must happen in the right address space.
+        if allocation.data.is_table() && !table {
+            throw_ub!("byte memory access to an externref table allocation");
+        }
+        if !allocation.data.is_table() && table {
+            throw_ub!("externref table access to a regular memory allocation");
         }
         if ptr.addr != allocation.addr {
             throw_ub!("deallocating with pointer not to the beginning of its allocation");
@@ -192,9 +286,10 @@ The helper function `check_ptr` we define for them is also used to implement the
 ```rust
 impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
     /// Check if the given pointer is dereferenceable for an access of the given
-    /// length. For dereferenceable, return the allocation ID and
+    /// length in the given address space (`table` indicates the externref table
+    /// address space). For dereferenceable, return the allocation ID and
     /// offset; this can be missing for invalid pointers and accesses of size 0.
-    fn check_ptr(&self, ptr: ThinPointer<Provenance<ProvExtra>>, len: Size) -> Result<Option<(AllocId, ProvExtra, Size)>> {
+    fn check_ptr(&self, ptr: ThinPointer<Provenance<ProvExtra>>, len: Size, table: bool) -> Result<Option<(AllocId, ProvExtra, Size)>> {
         // For zero-sized accesses, there is nothing to check.
         // (Provenance monotonicity says that if we allow zero-sized accesses
         // for `None` provenance we have to allow it for all provenance.)
@@ -210,6 +305,13 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         let allocation = self.allocations[id.0];
         if !allocation.live {
             throw_ub!("dereferencing pointer to dead allocation");
+        }
+        // The access must happen in the address space this allocation belongs to.
+        if allocation.data.is_table() && !table {
+            throw_ub!("byte memory access to an externref table allocation");
+        }
+        if !allocation.data.is_table() && table {
+            throw_ub!("externref table access to a regular memory allocation");
         }
 
         // Compute relative offset, and ensure we are in-bounds.
@@ -235,7 +337,7 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
             throw_ub!("store to a misaligned pointer");
         }
         let size = Size::from_bytes(bytes.len()).unwrap();
-        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, size)? else {
+        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, size, /* table */ false)? else {
             return ret(());
         };
         let mut allocation = self.allocations[id.0];
@@ -244,7 +346,9 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         handle_extra(&mut allocation.extra, prov_extra, offset)?;
 
         // Slice into the contents, and put the new bytes there.
-        allocation.data.write_subslice_at_index(offset.bytes(), bytes);
+        let mut data = allocation.data.expect_bytes("check_ptr ensures this is a byte allocation");
+        data.write_subslice_at_index(offset.bytes(), bytes);
+        allocation.data = AllocationData::Bytes(data);
         self.allocations.set(id.0, allocation);
 
         ret(())
@@ -260,7 +364,7 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         if !align.is_aligned(ptr.addr) {
             throw_ub!("load from a misaligned pointer");
         }
-        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, len)? else {
+        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, len, /* table */ false)? else {
             return ret(list![]);
         };
         let mut allocation = self.allocations[id.0];
@@ -270,7 +374,58 @@ impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
         self.allocations.set(id.0, allocation);
 
         // Slice into the contents, and copy them to a new list.
-        ret(allocation.data.subslice_with_length(offset.bytes(), len.bytes()))
+        ret(allocation.data.expect_bytes("check_ptr ensures this is a byte allocation").subslice_with_length(offset.bytes(), len.bytes()))
+    }
+}
+```
+
+The corresponding operations on the externref table address space mirror the byte operations, except that there are no alignment requirements and the contents are whole externref slots.
+
+```rust
+impl<T: Target, ProvExtra, AllocExtra> BasicMemory<T, ProvExtra, AllocExtra> {
+    fn table_store(
+        &mut self,
+        ptr: ThinPointer<Provenance<ProvExtra>>,
+        slots: List<ExternRefSlot>,
+        handle_extra: impl FnOnce(&mut AllocExtra, ProvExtra, Offset) -> Result,
+    ) -> Result {
+        let count = Size::from_bytes(slots.len()).unwrap();
+        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, count, /* table */ true)? else {
+            return ret(());
+        };
+        let mut allocation = self.allocations[id.0];
+
+        // Check and update "extra" state.
+        handle_extra(&mut allocation.extra, prov_extra, offset)?;
+
+        // Slice into the contents, and put the new slots there.
+        let mut data = allocation.data.expect_table("check_ptr ensures this is a table allocation");
+        data.write_subslice_at_index(offset.bytes(), slots);
+        allocation.data = AllocationData::Table(data);
+        self.allocations.set(id.0, allocation);
+
+        ret(())
+    }
+
+    fn table_load(
+        &mut self,
+        ptr: ThinPointer<Provenance<ProvExtra>>,
+        count: Int,
+        handle_extra: impl FnOnce(&mut AllocExtra, ProvExtra, Offset) -> Result,
+    ) -> Result<List<ExternRefSlot>> {
+        // The callers ensure that `count` is non-negative.
+        let count = Size::from_bytes(count).unwrap();
+        let Some((id, prov_extra, offset)) = self.check_ptr(ptr, count, /* table */ true)? else {
+            return ret(list![]);
+        };
+        let mut allocation = self.allocations[id.0];
+
+        // Check and update "extra" state.
+        handle_extra(&mut allocation.extra, prov_extra, offset)?;
+        self.allocations.set(id.0, allocation);
+
+        // Slice into the contents, and copy them to a new list.
+        ret(allocation.data.expect_table("check_ptr ensures this is a table allocation").subslice_with_length(offset.bytes(), count.bytes()))
     }
 }
 ```
@@ -323,7 +478,7 @@ impl<T: Target> Memory for BasicMemory<T> {
     }
 
     fn deallocate(&mut self, ptr: ThinPointer<Self::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result {
-        self.deallocate(ptr, kind, size, align, |(), ()| ret(()))
+        self.deallocate(ptr, kind, size, align, /* table */ false, |(), ()| ret(()))
     }
 
     fn store(&mut self, ptr: ThinPointer<Self::Provenance>, bytes: List<AbstractByte<Self::Provenance>>, align: Align) -> Result {
@@ -335,8 +490,36 @@ impl<T: Target> Memory for BasicMemory<T> {
     }
 
     fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result {
-        self.check_ptr(ptr, len)?;
+        self.check_ptr(ptr, len, /* table */ false)?;
         ret(())
+    }
+
+    fn table_allocate(&mut self, kind: AllocationKind, count: Int) -> NdResult<ThinPointer<Self::Provenance>> {
+        self.table_allocate(kind, count, (), ())
+    }
+
+    fn table_deallocate(&mut self, ptr: ThinPointer<Self::Provenance>, kind: AllocationKind, count: Int) -> Result {
+        // The callers ensure that `count` is non-negative.
+        self.deallocate(ptr, kind, Size::from_bytes(count).unwrap(), Align::ONE, /* table */ true, |(), ()| ret(()))
+    }
+
+    fn table_store(&mut self, ptr: ThinPointer<Self::Provenance>, slots: List<ExternRefSlot>) -> Result {
+        self.table_store(ptr, slots, |(), (), _offset| ret(()))
+    }
+
+    fn table_load(&mut self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result<List<ExternRefSlot>> {
+        self.table_load(ptr, count, |(), (), _offset| ret(()))
+    }
+
+    fn table_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, count: Int) -> Result {
+        // The callers ensure that `count` is non-negative.
+        self.check_ptr(ptr, Size::from_bytes(count).unwrap(), /* table */ true)?;
+        ret(())
+    }
+
+    fn is_table_provenance(&self, provenance: Self::Provenance) -> bool {
+        let (id, ()) = provenance;
+        self.allocations[id.0].data.is_table()
     }
 
     fn new_call() -> Self::FrameExtra {

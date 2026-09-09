@@ -116,6 +116,9 @@ impl<'tcx> Ctxt<'tcx> {
         Program {
             start,
             functions: self.functions,
+            // Rust has no surface syntax for externref, so no extern function
+            // declarations are ever translated.
+            extern_functions: Default::default(),
             globals: self.globals,
             vtables: self.vtables,
             traits: self.traits,

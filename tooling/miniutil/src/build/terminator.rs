@@ -147,6 +147,36 @@ impl FunctionBuilder {
         });
     }
 
+    pub fn extern_ref_allocate(&mut self, count: ValueExpr, ret_place: PlaceExpr) {
+        self.finish_with_next_block(|next_block| {
+            extern_ref_allocate(count, ret_place, bbname_into_u32(next_block))
+        });
+    }
+
+    pub fn extern_ref_deallocate(&mut self, ptr: ValueExpr, count: ValueExpr) {
+        self.finish_with_next_block(|next_block| {
+            extern_ref_deallocate(ptr, count, bbname_into_u32(next_block))
+        });
+    }
+
+    pub fn extern_ref_copy(&mut self, dst: ValueExpr, src: ValueExpr) {
+        self.finish_with_next_block(|next_block| {
+            extern_ref_copy(dst, src, bbname_into_u32(next_block))
+        });
+    }
+
+    pub fn extern_ref_write_null(&mut self, ptr: ValueExpr) {
+        self.finish_with_next_block(|next_block| {
+            extern_ref_write_null(ptr, bbname_into_u32(next_block))
+        });
+    }
+
+    pub fn extern_ref_is_null(&mut self, ret: PlaceExpr, ptr: ValueExpr) {
+        self.finish_with_next_block(|next_block| {
+            extern_ref_is_null(ret, ptr, bbname_into_u32(next_block))
+        });
+    }
+
     pub fn spawn(&mut self, f: FnName, data_ptr: ValueExpr, ret: PlaceExpr) {
         self.finish_with_next_block(|next_block| {
             spawn(fn_ptr(f), data_ptr, ret, bbname_into_u32(next_block))
@@ -400,6 +430,51 @@ pub fn deallocate(ptr: ValueExpr, size: ValueExpr, align: ValueExpr, next: u32) 
         intrinsic: IntrinsicOp::Deallocate,
         arguments: list![ptr, size, align],
         ret: unit_place(),
+        next_block: Some(BbName(Name::from_internal(next))),
+    }
+}
+
+pub fn extern_ref_allocate(count: ValueExpr, ret_place: PlaceExpr, next: u32) -> Terminator {
+    Terminator::Intrinsic {
+        intrinsic: IntrinsicOp::ExternRefAllocate,
+        arguments: list![count],
+        ret: ret_place,
+        next_block: Some(BbName(Name::from_internal(next))),
+    }
+}
+
+pub fn extern_ref_deallocate(ptr: ValueExpr, count: ValueExpr, next: u32) -> Terminator {
+    Terminator::Intrinsic {
+        intrinsic: IntrinsicOp::ExternRefDeallocate,
+        arguments: list![ptr, count],
+        ret: unit_place(),
+        next_block: Some(BbName(Name::from_internal(next))),
+    }
+}
+
+pub fn extern_ref_copy(dst: ValueExpr, src: ValueExpr, next: u32) -> Terminator {
+    Terminator::Intrinsic {
+        intrinsic: IntrinsicOp::ExternRefCopy,
+        arguments: list![dst, src],
+        ret: unit_place(),
+        next_block: Some(BbName(Name::from_internal(next))),
+    }
+}
+
+pub fn extern_ref_write_null(ptr: ValueExpr, next: u32) -> Terminator {
+    Terminator::Intrinsic {
+        intrinsic: IntrinsicOp::ExternRefWriteNull,
+        arguments: list![ptr],
+        ret: unit_place(),
+        next_block: Some(BbName(Name::from_internal(next))),
+    }
+}
+
+pub fn extern_ref_is_null(ret: PlaceExpr, ptr: ValueExpr, next: u32) -> Terminator {
+    Terminator::Intrinsic {
+        intrinsic: IntrinsicOp::ExternRefIsNull,
+        arguments: list![ptr],
+        ret,
         next_block: Some(BbName(Name::from_internal(next))),
     }
 }
